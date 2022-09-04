@@ -5,6 +5,11 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAStream.h>
 
+
+#include "NVPMAAllocCapturer.h"  // <bojian/DynamicCUDAGraph>
+#include "NVPMAAllocCompressor.h"
+
+
 namespace at {
 
 struct CUDAGeneratorImpl;
@@ -15,12 +20,31 @@ namespace cuda {
 // to CUDAGraph::capture_begin
 TORCH_CUDA_CPP_API MempoolId_t graph_pool_handle();
 
+
+// class CUDAGraphShadowRef;  // <bojian/DynamicCUDAGraph>
+class NVPMAAllocCapturer;
+
+
 struct TORCH_CUDA_CPP_API CUDAGraph {
-  CUDAGraph();
+  
+  // <bojian/DynamicCUDAGraph>
+  // CUDAGraph();
+  explicit CUDAGraph(const bool compress_metadata = false);
+
+
   ~CUDAGraph();
 
   void capture_begin(MempoolId_t pool={0, 0});
   void capture_end();
+
+
+  // <bojian/DynamicCUDAGraph> Split the epilog into a different method since we
+  //                           might need to postpone it when doing the
+  //                           compression.
+  void capture_end_epilog();
+  void decompress();
+
+
   void replay();
   void reset();
   MempoolId_t pool();
@@ -29,6 +53,17 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
   cudaGraph_t graph_ = NULL;
   cudaGraphExec_t graph_exec_ = NULL;
+
+
+  // <bojian/DynamicCUDAGraph>
+  // NVPMAAllocCapturer capturer_;
+  // bool capturer_materialized_ = false;
+  bool _compress_metadata = false;
+  NVPMAAllocCapturer _main_capturer, _residual_capturer;
+  ZeroCompressedPtr _zero_compressed_main_metadata,
+                    _zero_compressed_residual_metadata;
+
+
 #endif
 
   // internal states so reset() can do its best cleaning up
@@ -71,6 +106,12 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   // RNG state trackers
   at::Tensor offset_extragraph_;
   uint64_t wholegraph_increment_;
+
+
+  // friend class CUDAGraphShadowRef;  // <bojian/DynamicCUDAGraph>
+  friend class NVPMAAllocCapturer;
+
+
 };
 
 } // namespace cuda

@@ -1964,3 +1964,8 @@ endif()
 
 # Include google/FlatBuffers
 include(${CMAKE_CURRENT_LIST_DIR}/FlatBuffers.cmake)
+
+# Include DMLC headers
+include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third_party/dmlc-core/include)
+add_definitions(-DDMLC_LOG_STACK_TRACE=1)
+include_directories(SYSTEM /usr/local/cuda/samples/Common)

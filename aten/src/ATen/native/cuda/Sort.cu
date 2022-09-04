@@ -13,6 +13,11 @@
 #include <limits>
 #include <c10/core/DeviceArray.h>
 
+
+// <bojian/DynamicCUDAGraph>
+#include <ATen/cuda/CUDAGlobalExecMask.cuh>
+
+
 namespace at { namespace native {
 
 // In alignment with default sort on a c++ map, this function
@@ -50,6 +55,44 @@ void sortKeyValueInplace(const TensorBase& key,
   dim3 grid;
   TORCH_INTERNAL_ASSERT(getGridFromTiles(keySlices, grid), "Too many slices to sort");
 
+
+// <bojian/DynamicCUDAGraph>
+// #define HANDLE_CASE(TYPE, A, SIZE)                                      \
+//   do {                                                                  \
+//     int blockSize = SIZE / 2;                                           \
+//     if (blockSize < 1) {                                                \
+//       blockSize = 1;                                                    \
+//     }                                                                   \
+//                                                                         \
+//     dim3 block(blockSize);                                              \
+//                                                                         \
+//     if (dir) {                                                          \
+//       bitonicSortKVInPlace<scalar_t, int64_t, A, -1,                    \
+//           GTOp<scalar_t, true>, TYPE, SIZE>                           \
+//         <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(        \
+//           keyInfo,                                                      \
+//           keySlices,                                                    \
+//           (TYPE) keySliceSize,                                          \
+//           (TYPE) keyInfo.strides[collapseKeyDim],                       \
+//           valueInfo,                                                    \
+//           (TYPE) valueInfo.strides[collapseValueDim],                   \
+//           GTOp<scalar_t, true>());                                    \
+//       C10_CUDA_KERNEL_LAUNCH_CHECK();                                   \
+//     } else {                                                            \
+//       bitonicSortKVInPlace<scalar_t, int64_t, A, -1,                    \
+//       LTOp<scalar_t, true>, TYPE, SIZE>                               \
+//         <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(        \
+//           keyInfo,                                                      \
+//           keySlices,                                                    \
+//           (TYPE) keySliceSize,                                          \
+//           (TYPE) keyInfo.strides[collapseKeyDim],                       \
+//           valueInfo,                                                    \
+//           (TYPE) valueInfo.strides[collapseValueDim],                   \
+//           LTOp<scalar_t, true>());                                    \
+//       C10_CUDA_KERNEL_LAUNCH_CHECK();                                   \
+//     }                                                                   \
+//   } while (0)
+
 #define HANDLE_CASE(TYPE, A, SIZE)                                      \
   do {                                                                  \
     int blockSize = SIZE / 2;                                           \
@@ -69,7 +112,9 @@ void sortKeyValueInplace(const TensorBase& key,
           (TYPE) keyInfo.strides[collapseKeyDim],                       \
           valueInfo,                                                    \
           (TYPE) valueInfo.strides[collapseValueDim],                   \
-          GTOp<scalar_t, true>());                                    \
+          GTOp<scalar_t, true>() \
+          CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS \
+          ); \
       C10_CUDA_KERNEL_LAUNCH_CHECK();                                   \
     } else {                                                            \
       bitonicSortKVInPlace<scalar_t, int64_t, A, -1,                    \
@@ -81,7 +126,9 @@ void sortKeyValueInplace(const TensorBase& key,
           (TYPE) keyInfo.strides[collapseKeyDim],                       \
           valueInfo,                                                    \
           (TYPE) valueInfo.strides[collapseValueDim],                   \
-          LTOp<scalar_t, true>());                                    \
+          LTOp<scalar_t, true>() \
+          CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS \
+          ); \
       C10_CUDA_KERNEL_LAUNCH_CHECK();                                   \
     }                                                                   \
   } while (0)

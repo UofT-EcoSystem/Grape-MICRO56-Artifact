@@ -21,6 +21,11 @@
 #include <ATen/native/cuda/jit_utils.h>
 #include <iostream>
 
+
+// <bojian/DynamicCUDAGraph>
+#include "CUDAGlobalExecMask.cuh"
+
+
 namespace at { namespace native {
 
 using at::detail::Array;
@@ -217,8 +222,20 @@ std::ostream& operator<<(std::ostream& out, const ReduceConfig& config);
 
 template<int nt, int output_vec_size, typename R>
 C10_LAUNCH_BOUNDS_2(nt, 4)
-__global__ void reduce_kernel(R reduction) {
+__global__ void reduce_kernel(R reduction
+
+                              // <bojian/DynamicCUDAGraph>
+                              CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
+                              
+                              ) {
+
+  // <bojian/DynamicCUDAGraph>
+  UPDATE_GLOBAL_EXEC_MASK {
+
   reduction.template run<output_vec_size>();
+
+  } // <bojian/DynamicCUDAGraph>
+
 }
 
 template <typename index_t>
@@ -885,15 +902,30 @@ static void launch_reduce_kernel(const ReduceConfig& config, const R& reduction)
 
   switch(config.output_vec_size) {
   case 4:
-    reduce_kernel<max_threads / 4, 4, R><<<grid, block, shared_memory, stream>>>(reduction);
+    reduce_kernel<max_threads / 4, 4, R><<<grid, block, shared_memory, stream>>>(reduction
+    
+                                                                                 // <bojian/DynamicCUDAGraph>
+                                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+                                                                                 );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   case 2:
-    reduce_kernel<max_threads / 2, 2, R><<<grid, block, shared_memory, stream>>>(reduction);
+    reduce_kernel<max_threads / 2, 2, R><<<grid, block, shared_memory, stream>>>(reduction
+    
+                                                                                 // <bojian/DynamicCUDAGraph>
+                                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+                                                                                 );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   default:
-    reduce_kernel<max_threads / 1, 1, R><<<grid, block, shared_memory, stream>>>(reduction);
+    reduce_kernel<max_threads / 1, 1, R><<<grid, block, shared_memory, stream>>>(reduction
+    
+                                                                                 // <bojian/DynamicCUDAGraph>
+                                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+                                                                                 );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }

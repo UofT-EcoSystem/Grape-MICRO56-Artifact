@@ -1,7 +1,7 @@
+#include <ATen/Functions.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/Exceptions.h>
-#include <ATen/Functions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 
@@ -42,12 +42,21 @@ MempoolId_t graph_pool_handle() {
  * describes memory management for captures.
  */
 
-CUDAGraph::CUDAGraph()
-  // CUDAStreams may not be default-constructed.
-  : capture_stream_(at::cuda::getCurrentCUDAStream()) {
+CUDAGraph::CUDAGraph(
+    // <bojian/DynamicCUDAGraph>
+    const bool compress_metadata)
+    // CUDAStreams may not be default-constructed.
+    : capture_stream_(at::cuda::getCurrentCUDAStream()) {
 #if (defined(CUDA_VERSION) && CUDA_VERSION < 11000) || defined(USE_ROCM)
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
+
+  // <bojian/DynamicCUDAGraph>
+  // LOG(WARNING) << "Constructor invoked";
+  _compress_metadata = compress_metadata;
+  // if (_compress_metadata) {
+  //   LOG(WARNING) << "CUDAGraph's metadata is configured to be compressed";
+  // }
 }
 
 void CUDAGraph::capture_begin(MempoolId_t pool/*=0*/) {
@@ -137,6 +146,30 @@ void CUDAGraph::capture_end() {
   TORCH_CHECK(graph_ != NULL, "Invalid capture.");
   has_graph_ = true;
 
+  // <bojian/DynamicCUDAGraph>
+  // capturer_.setToRecordNextMalloc();
+  if (_compress_metadata) {
+    // Directly exit if compressing the metadata, since we will be materializing
+    // the executors later.
+
+    LOG(INFO) << "Skipping the instantiation of graph=" << graph_
+              << " since it is to be compressed";
+
+    return;
+  }
+
+
+  // <bojian/DynamicCUDAGraph> Split the epilog into a different method since we
+  //                           might need to postpone it when doing the
+  //                           compression.
+  capture_end_epilog();
+
+
+}
+
+
+// <bojian/DynamicCUDAGraph>
+void CUDAGraph::capture_end_epilog() {
   // Trailing NULL, NULL, 0 arguments were recommended by Cuda driver people,
   // who prefer not to report error message through these arguments moving forward
   // (they prefer return value, or errors on api calls internal to the capture)
@@ -160,6 +193,22 @@ void CUDAGraph::capture_end() {
 #endif
 }
 
+
+// <bojian/DynamicCUDAGraph>
+extern struct DecompressEngine gDecompressEngine;
+
+void CUDAGraph::decompress() {
+  if (_compress_metadata) {
+    _main_capturer.deflateZeros(_zero_compressed_main_metadata);
+    if (_residual_capturer.shadow_ptr() != nullptr) {
+      _residual_capturer.deflateZeros(_zero_compressed_residual_metadata);
+    }
+    checkCudaErrors(cudaStreamSynchronize(gDecompressEngine.stream));
+  }
+}
+// </bojian/DynamicCUDAGraph>
+
+
 void CUDAGraph::replay() {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
   TORCH_CHECK(has_graph_exec_,
@@ -177,8 +226,26 @@ void CUDAGraph::replay() {
   }
   offset_extragraph_.fill_(int64_t(rng_engine_inputs.offset_.val));
 
+  // checkCudaErrors(cudaDeviceSynchronize());
+
   // graph_exec_ may be replayed in any stream.
   AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+
+  // <bojian/DynamicCUDAGraph>
+  // if (!capturer_materialized_) {
+  //   capturer_.materialize();
+  //   capturer_.dump(
+  //       "cuda_graph-uuid_" + std::to_string((id_ - 1) / 3),
+  //       /*as_plain_text=*/true);
+  //   capturer_materialized_ = true;
+  // }
+
+  // AT_CUDA_CHECK(cudaDeviceSynchronize());
+  // if (cudaDeviceSynchronize() != cudaSuccess) {
+  //   cudaGetLastError();
+  //   LOG(WARNING) << "Neglecting the error from the graph launch call";
+  // }
+
 
   int version;
   AT_CUDA_CHECK(cudaDriverGetVersion(&version));

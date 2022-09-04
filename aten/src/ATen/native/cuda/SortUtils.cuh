@@ -7,6 +7,11 @@
 #include <ATen/native/cuda/SortingCommon.cuh>
 #include <ATen/native/cuda/Sort.h>
 
+
+// <bojian/DynamicCUDAGraph>
+#include <ATen/cuda/CUDAGlobalExecMask.cuh>
+
+
 namespace at { namespace native {
 
 template <typename T>
@@ -89,7 +94,19 @@ bitonicSortKVInPlace(at::cuda::detail::TensorInfo<K, IndexType> keys,
                      IndexType keySliceStride,
                      at::cuda::detail::TensorInfo<V, IndexType> values,
                      IndexType valueSliceStride,
-                     Comparator comp) {
+                     Comparator comp
+                     
+                     
+                     // <bojian/DynamicCUDAGraph>
+                     CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
+                     
+                     
+                     ) {
+
+  // <bojian/DynamicCUDAGraph>
+  UPDATE_GLOBAL_EXEC_MASK {
+
+
   // Find the slice of the tensor that we are sorting
   const IndexType linearIndex = getLinearBlockId<IndexType>();
   // Tiling the slices could have us be out of bounds, if there are a
@@ -156,6 +173,9 @@ bitonicSortKVInPlace(at::cuda::detail::TensorInfo<K, IndexType> keys,
         sharedValues[elem2];
     }
   }
+
+  } // <bojian/DynamicCUDAGraph>
+
 }
 
 }} // at::native

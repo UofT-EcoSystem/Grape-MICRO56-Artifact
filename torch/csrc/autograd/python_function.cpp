@@ -25,6 +25,8 @@
 #include <torch/csrc/Exceptions.h>
 #include <ATen/FuncTorchTLS.h>
 
+#include <dmlc/logging.h>
+
 #include <exception>
 #include <functional>
 #include <memory>

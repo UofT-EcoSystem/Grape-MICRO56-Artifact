@@ -24,6 +24,11 @@
 #include <c10/util/Optional.h>
 #include <c10/util/SmallVector.h>
 
+
+// <bojian/DynamicCUDAGraph>
+#include <dmlc/logging.h>
+
+
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -1307,6 +1312,51 @@ QuantizerPtr create_subtensor_quantizer(const Tensor& self, bool is_select, int6
   }
   return quantizer;
 }
+
+
+// <bojian/DynamicCUDAGraph>
+Tensor select(const Tensor& self, int64_t dim, const Tensor& index) {
+  // LOG(INFO) << "Invoking the customized select function with index=" << index;
+
+  int64_t ndim = self.dim();
+  dim = maybe_wrap_dim(dim, ndim);
+
+  DimVector sizes(self.sizes().begin(), self.sizes().end());
+  DimVector strides(self.strides().begin(), self.strides().end());
+  int64_t dim_size = sizes[dim], dim_stride = strides[dim];
+  sizes.erase(sizes.begin() + dim);
+  strides.erase(strides.begin() + dim);
+
+  Tensor result =
+      self.as_strided_w_device_storage_offset(sizes, strides, dim_size, dim_stride, index);
+  namedinference::propagate_names_except(result, self, {dim});
+  return result;
+
+  // return self;
+}
+
+Tensor as_strided_w_device_storage_offset(
+    const Tensor& self,
+    at::IntArrayRef sizes,
+    at::IntArrayRef strides,
+    int64_t dim_size,
+    int64_t dim_stride,
+    const Tensor& index) {
+  Tensor result = at::detail::make_tensor<TensorImpl>(
+      c10::TensorImpl::VIEW, Storage(self.storage()), self.key_set(), self.dtype());
+  setStrided(result, sizes, strides, self.storage_offset());
+
+  TensorImpl *result_tensor_impl = result.unsafeGetTensorImpl();
+  result_tensor_impl->set_device_storage_offsets(self.device_storage_offsets());
+  result_tensor_impl->push_device_storage_offset(dim_size, dim_stride, index.data_ptr());
+  if (result_tensor_impl->sizes() != sizes ||
+      result_tensor_impl->strides() != strides) {
+    result_tensor_impl->set_sizes_and_strides(sizes, strides);
+  }
+  return result;
+}
+
+
 
 Tensor select(const Tensor& self, int64_t dim, int64_t index) {
   int64_t ndim = self.dim();

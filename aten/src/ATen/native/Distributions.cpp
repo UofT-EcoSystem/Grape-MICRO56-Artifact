@@ -585,20 +585,29 @@ Tensor& multinomial_out(const Tensor& self,
       "multinomial is not implemented for half on CPU");
   if (!with_replacement) {
     // Sanity checks on `self`.
-    auto is_valid = ((self.max() < INFINITY) & (self.min() >= 0)).item();
-    TORCH_CHECK(
-        is_valid.to<bool>(),
-        "probability tensor contains either `inf`, `nan` or element < 0");
+
+
+    // <bojian/DynamicCUDAGraph>
+    // auto is_valid = ((self.max() < INFINITY) & (self.min() >= 0)).item();
+    // TORCH_CHECK(
+    //     is_valid.to<bool>(),
+    //     "probability tensor contains either `inf`, `nan` or element < 0");
+
+
     // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    bool zero_prob_condition;
-    if (self.dim() == 1){
-      zero_prob_condition = (self.sum() == 0).item().to<bool>();
-    } else {
-      zero_prob_condition = (self.sum(1) == 0).sum().item().to<bool>();
-    }
-    TORCH_CHECK(
-        !zero_prob_condition,
-        "invalid multinomial distribution (sum of probabilities <= 0)");
+    // bool zero_prob_condition;
+
+
+    // <bojian/DynamicCUDAGraph>
+    // if (self.dim() == 1){
+    //   zero_prob_condition = (self.sum() == 0).item().to<bool>();
+    // } else {
+    //   zero_prob_condition = (self.sum(1) == 0).sum().item().to<bool>();
+    // }
+    // TORCH_CHECK(
+    //     !zero_prob_condition,
+    //     "invalid multinomial distribution (sum of probabilities <= 0)");
+
 
     // The algorithm is from gumbel softmax.
     // s = argmax( logp - log(-log(eps)) ) where eps ~ U(0, 1)

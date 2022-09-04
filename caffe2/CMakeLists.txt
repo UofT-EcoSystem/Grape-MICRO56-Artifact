@@ -1012,6 +1012,13 @@ elseif(USE_CUDA)
   endif()
 endif()
 
+
+# <bojian/DynamicCUDAGraph>
+if(USE_CUDA)
+  target_link_libraries(torch_cuda PRIVATE boost_filesystem)
+endif()
+
+
 if(USE_CUDA OR USE_ROCM)
   include(${TORCH_SRC_DIR}/csrc/jit/codegen/cuda/nvfuser.cmake)
 endif()

@@ -9,6 +9,11 @@
 #include <c10/util/irange.h>
 #include <c10/util/llvmMathExtras.h>
 
+// <bojian/DynamicCUDAGraph>
+#include <dmlc/logging.h>
+#include <dmlc/parameter.h>
+#include <iostream>
+
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <bitset>
@@ -277,7 +282,57 @@ struct AllocParams {
   Block* block;
   StatTypes stat_types = {false};
   cudaError_t err;
+
+  friend std::ostream& operator<<(
+      std::ostream& out,
+      const AllocParams& alloc_params);
 };
+
+// <bojian/DynamicCUDAGraph>
+std::ostream& operator<<(std::ostream& out, const Block* const block) {
+  if (!block) {
+    out << "<NullBlock>";
+    return out;
+  }
+  std::ostringstream strout;
+  strout << "[";
+  for (const cuda::CUDAStream& stream : block->stream_uses) {
+    strout << stream.id() << ", ";
+  }
+  strout << "]";
+  out << "Block{.addr=" << static_cast<const void*>(block)
+      << ", .stream_uses=" << strout.str() << ", .ptr=" << block->ptr
+      << ", .allocated=" << std::boolalpha << block->allocated
+      << std::noboolalpha << "}";
+  return out;
+}
+
+std::ostream& operator<<(std::ostream& out, Block* const block) {
+  return (out << const_cast<const Block*>(block));
+}
+
+std::ostream& operator<<(std::ostream& out, const AllocParams& alloc_params) {
+  out << "AllocParams{\n"
+      << "\t.device=" << alloc_params.device() << "\n"
+      << "\t.stream=" << alloc_params.stream() << "\n"
+      << "\t.size=" << format_size(alloc_params.size()) << "\n"
+      << "\t.pool=" << alloc_params.pool << "\n"
+      << "\t.alloc_size=" << format_size(alloc_params.alloc_size)
+      << "\n"
+      // Cannot log the block here since it is possible for the block to be
+      // released by `try_merge_block` function call.
+      //
+      // << "\t.block=" << alloc_params.block << "\n"
+      << "}";
+
+  return out;
+}
+
+std::ostream& operator<<(std::ostream& out, const MempoolId_t& mempool_id) {
+  out << "MempoolId{.capture_begin=" << mempool_id.first
+      << ", graph_pool_handle=" << mempool_id.second << "}";
+  return out;
+}
 
 // CUDA graphs helper
 struct PrivatePool {
@@ -446,6 +501,9 @@ class DeviceCachingAllocator {
   // whether they came from graph_pools or one of the BlockPools above.
   ska::flat_hash_set<Block*> active_blocks;
 
+  // <bojian/DynamicCUDAGraph>
+  ska::flat_hash_set<Block*> active_blocks_inside_memory_pool;
+
   // captures_underway tracks if a capture might be underway on any stream.
   // Most of the time it's zero, in which case malloc can avoid calling
   // cudaStreamGetCaptureInfo in the hot path.
@@ -480,6 +538,28 @@ class DeviceCachingAllocator {
   // Maps a capturing stream to its assigned private pool,
   // in case we want multiple captures to share the same pool
   ska::flat_hash_map<CaptureId_t, MempoolId_t> capture_to_pool_map;
+
+  // <bojian/DynamicCUDAGraph>
+  ska::flat_hash_map<
+      MempoolId_t,
+      std::vector<std::pair<AllocParams, Block>>,
+      MempoolIdHash>
+      taped_alloc_params_with_block_copy;
+  MempoolId_t current_mempool_id;
+  std::stack<MempoolId_t> outer_scope_mempool_ids;
+  size_t num_of_mallocs_requested = 0, num_of_extra_mallocs_requested = 0;
+  bool taping_malloc = false, using_taped_malloc = false;
+
+  bool inside_memory_pool = false;
+  std::stack<bool> outer_scope_inside_memory_pool_flags;
+  bool report_memory_leaks = false;
+
+  void tape_alloc_params(const AllocParams& alloc_params, Block* const block) {
+    if (taping_malloc) {
+      taped_alloc_params_with_block_copy.at(current_mempool_id)
+          .emplace_back(alloc_params, *block);
+    }
+  }
 
  public:
   DeviceCachingAllocator()
@@ -524,6 +604,12 @@ class DeviceCachingAllocator {
 
     // Can't reuse an existing block; try to get a new one.
     if (!block_found) {
+      if (report_memory_leaks) {
+        LOG(WARNING)
+            << "Memory pool is in use but we are still requesting an extra "
+            << params;
+      }
+
       // Do garbage collection if the flag is set.
       if (C10_UNLIKELY(
               set_fraction &&
@@ -608,7 +694,9 @@ class DeviceCachingAllocator {
     Block* remaining = nullptr;
 
     const bool already_split = block->is_split();
-    if (should_split(block, size)) {
+    // <bojian/DynamicCUDAGraph> Do not split the memory blocks in the case of
+    //                           using the taped memory allocations.
+    if (should_split(block, size) && !using_taped_malloc) {
       remaining = block;
 
       block = new Block(device, stream, size, &pool, block->ptr);
@@ -645,8 +733,18 @@ class DeviceCachingAllocator {
     }
 
     block->allocated = true;
-    bool inserted = active_blocks.insert(block).second;
-    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+
+    // <bojian/DynamicCUDAGraph> Do NOT insert into the active_blocks in the
+    //                           case of using taped memory allocations.
+    if (!using_taped_malloc) {
+      bool inserted = active_blocks.insert(block).second;
+
+      // <bojian/DynamicCUDAGraph>
+      if (inside_memory_pool) {
+        active_blocks_inside_memory_pool.insert(block);
+      }
+      TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+    }
 
     for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
       update_stat(stats.allocation[stat_type], 1);
@@ -663,6 +761,9 @@ class DeviceCachingAllocator {
         stats.allocated_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         c10::Device(c10::DeviceType::CUDA, device));
+
+    // <bojian/DynamicCUDAGraph>
+    tape_alloc_params(params, block);
 
     return block;
   }
@@ -913,6 +1014,23 @@ class DeviceCachingAllocator {
   void notifyCaptureBegin(CaptureId_t graph_id, MempoolId_t mempool_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     captures_underway++;
+
+    // <bojian/DynamicCUDAGraph>
+    if (inside_memory_pool) {
+      auto it = graph_pools.find(mempool_id);
+      TORCH_INTERNAL_ASSERT(it != graph_pools.end());
+      it->second->use_count++;
+      bool inserted = capture_to_pool_map.insert({graph_id, mempool_id}).second;
+      TORCH_INTERNAL_ASSERT(inserted);
+      return;
+    }
+    if ((taping_malloc || using_taped_malloc) &&
+        (mempool_id != current_mempool_id)) {
+      LOG(INFO) << "Overwriting mempool_id=" << mempool_id
+                << " with current_mempool_id=" << current_mempool_id;
+      mempool_id = current_mempool_id;
+    }
+
     auto it = graph_pools.find(mempool_id);
     if (it == graph_pools.end()) {
       // mempool_id does not reference an existing pool. Make a new pool for
@@ -966,6 +1084,98 @@ class DeviceCachingAllocator {
     }
   }
 
+  // <bojian/DynamicCUDAGraph>
+  bool is_using_taped_malloc() const {
+    return using_taped_malloc;
+  }
+
+  void notifyMempoolBegin(const MempoolId_t& mempool_id, const int enter_cnt) {
+    current_mempool_id = mempool_id;
+    inside_memory_pool = true;
+
+    auto it = graph_pools.find(mempool_id);
+    if (enter_cnt) {
+      report_memory_leaks = dmlc::GetEnv("MEMPOOL_REPORT_MEMORY_LEAKS", true);
+    }
+    if (it == graph_pools.end()) {
+      graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>());
+    } else {
+      TORCH_INTERNAL_ASSERT(it->second->use_count > 0);
+      it->second->use_count++;
+    }
+  }
+
+  void notifyMempoolEnd(const MempoolId_t& mempool_id, const int enter_cnt) {
+    // First set the inside_memory_pool flag to false, otherwise we will be
+    // modifying active_blocks_inside_memory_pool during the traversal.
+    inside_memory_pool = false;
+    if (enter_cnt) {
+      report_memory_leaks = false;
+    }
+    // Retire all the blocks of active_blocks_inside_memory_pool.
+    for (Block* block : active_blocks_inside_memory_pool) {
+      free(block);
+    }
+  }
+
+  // <bojian/DynamicCUDAGraph>
+  void notifyMemtapeBegin(const MempoolId_t& mempool_id, const int enter_cnt) {
+    outer_scope_mempool_ids.push(current_mempool_id);
+    current_mempool_id = mempool_id;
+    outer_scope_inside_memory_pool_flags.push(inside_memory_pool);
+    inside_memory_pool = false;
+
+    if (!enter_cnt) {
+      taping_malloc = true;
+      LOG(INFO) << "Taping memory allocations";
+
+      auto it = taped_alloc_params_with_block_copy.find(current_mempool_id);
+      if (it != taped_alloc_params_with_block_copy.end()) {
+        LOG(INFO) << "Clearing previous " << it->second.size()
+                  << " taped entries from " << it->first;
+        it->second.clear();
+      }
+      taped_alloc_params_with_block_copy.emplace(
+          current_mempool_id, std::vector<std::pair<AllocParams, Block>>());
+    } else {
+      using_taped_malloc = true;
+      num_of_mallocs_requested = 0;
+      num_of_extra_mallocs_requested = 0;
+      if (taped_alloc_params_with_block_copy.find(current_mempool_id) ==
+          taped_alloc_params_with_block_copy.end()) {
+        LOG(FATAL) << mempool_id << " has NOT been recorded before";
+      }
+    }
+  }
+
+  void notifyMemtapeEnd(const MempoolId_t& mempool_id, const int enter_cnt) {
+    if (taping_malloc) {
+      LOG(INFO)
+          << "Total number of mallocs recorded of " << current_mempool_id
+          << ": "
+          << taped_alloc_params_with_block_copy.at(current_mempool_id).size();
+      taping_malloc = false;
+    }
+    if (using_taped_malloc) {
+      if (num_of_mallocs_requested !=
+          taped_alloc_params_with_block_copy.at(current_mempool_id).size()) {
+        LOG(FATAL)
+            << "Number of requested mallocs != Number of taped mallocs of "
+            << current_mempool_id << ": " << num_of_mallocs_requested << " != "
+            << taped_alloc_params_with_block_copy.at(current_mempool_id).size();
+      }
+      using_taped_malloc = false;
+      if (num_of_extra_mallocs_requested != 0) {
+        LOG(INFO) << "Allocated " << num_of_extra_mallocs_requested
+                  << " new memory entries";
+      }
+    }
+    current_mempool_id = outer_scope_mempool_ids.top();
+    outer_scope_mempool_ids.pop();
+    inside_memory_pool = outer_scope_inside_memory_pool_flags.top();
+    outer_scope_inside_memory_pool_flags.pop();
+  }
+
  private:
   // All private methods do not acquire the allocator mutex.
 
@@ -991,6 +1201,11 @@ class DeviceCachingAllocator {
 
   /** moves a block into a pool of cached free blocks */
   void free_block(Block* block) {
+    // <bojian/DynamicCUDAGraph>
+    if (using_taped_malloc) {
+      return;
+    }
+
     TORCH_INTERNAL_ASSERT(
         !block->allocated && block->event_count == 0 &&
         block->stream_uses.empty());
@@ -1000,7 +1215,6 @@ class DeviceCachingAllocator {
     auto& pool = *block->pool;
     int64_t net_change_inactive_split_blocks = 0;
     int64_t net_change_inactive_split_size = 0;
-
     const std::array<Block*, 2> merge_candidates = {block->prev, block->next};
     for (Block* merge_candidate : merge_candidates) {
       const int64_t subsumed_size =
@@ -1012,6 +1226,12 @@ class DeviceCachingAllocator {
     }
 
     active_blocks.erase(block);
+
+    // <bojian/DynamicCUDAGraph>
+    if (inside_memory_pool) {
+      active_blocks_inside_memory_pool.erase(block);
+    }
+
     // Makes sure the Block* isn't already present in the pool we're freeing it
     // back into.
     bool inserted = pool.blocks.insert(block).second;
@@ -1070,6 +1290,18 @@ class DeviceCachingAllocator {
 
   BlockPool& get_pool(size_t size, cudaStream_t stream) {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
+
+    // <bojian/DynamicCUDAGraph>
+    if (inside_memory_pool) {
+      auto it = graph_pools.find(current_mempool_id);
+      TORCH_INTERNAL_ASSERT(it != graph_pools.end());
+      if (size <= kSmallSize) {
+        return it->second->small_blocks;
+      } else {
+        return it->second->large_blocks;
+      }
+    }
+
     // captures_underway is a conservative guess that the current stream may be
     // capturing. It's only > 0 if some thread has begun and not yet ended a
     // capture, so it's usually 0, and we can short-circuit
@@ -1127,6 +1359,47 @@ class DeviceCachingAllocator {
   }
 
   bool get_free_block(AllocParams& p) {
+    // <bojian/DynamicCUDAGraph> Check whether a taped memory allocation is
+    //                           available.
+    if (using_taped_malloc) {
+      while (true) {
+        try {
+          auto& past_alloc_params_with_block_copy =
+              taped_alloc_params_with_block_copy.at(current_mempool_id)
+                  .at(num_of_mallocs_requested);
+          ++num_of_mallocs_requested;
+          const AllocParams& past_alloc_params =
+              past_alloc_params_with_block_copy.first;
+          if (p.device() != past_alloc_params.device() ||
+              p.size() > past_alloc_params.size()) {
+            LOG(WARNING)
+                << "Unable to reuse taped allocation parameters, taped="
+                << past_alloc_params << " vs. requested=" << p;
+          } else {
+            // if (p.stream() != past_alloc_params.stream()) {
+            //   LOG(WARNING) << "Different streams of taped="
+            //                << past_alloc_params.stream()
+            //                << " vs. requested=" << p.stream();
+            // }
+            break;
+          }
+        } catch (const std::out_of_range& e) {
+          if (!num_of_extra_mallocs_requested) {
+            LOG(WARNING)
+                << "Running out of tape, allocating new memory entries.";
+            ++num_of_extra_mallocs_requested;
+          }
+          return false;
+        }
+      }
+      auto& past_alloc_params_with_block_copy =
+          taped_alloc_params_with_block_copy.at(current_mempool_id)
+              .at(num_of_mallocs_requested - 1);
+      p.block = &past_alloc_params_with_block_copy.second;
+      past_alloc_params_with_block_copy.second.gc_count = 0;
+      return true;
+    }
+
     BlockPool& pool = *p.pool;
 
     if (C10_UNLIKELY(
@@ -1138,8 +1411,17 @@ class DeviceCachingAllocator {
       }
     }
     auto it = pool.blocks.lower_bound(&p.search_key);
-    if (it == pool.blocks.end() || (*it)->stream != p.stream())
+    if (it == pool.blocks.end() || (*it)->stream != p.stream()) {
+      // <bojian/DynamicCUDAGraph>
+      // if (it != pool.blocks.end() && (*it)->stream != p.stream()) {
+      //   LOG(WARNING)
+      //       << "Detected a reusable block but it belongs to a different
+      //       stream: "
+      //       << "reusable block stream=" << (*it)->stream
+      //       << " != current stream=" << p.stream();
+      // }
       return false;
+    }
     // Do not return an oversized block for a large request
     if ((p.size() < CachingAllocatorConfig::max_split_size()) &&
         ((*it)->size >= CachingAllocatorConfig::max_split_size()))
@@ -1440,7 +1722,13 @@ class DeviceCachingAllocator {
   void insert_events_deferred_until_no_capture() {
     if (C10_UNLIKELY(needs_events_deferred_until_no_capture.size() > 0)) {
       for (auto* block : needs_events_deferred_until_no_capture) {
-        TORCH_INTERNAL_ASSERT(!block->stream_uses.empty());
+        // <bojian/DynamicCUDAGraph> It is possible that the block is already
+        //                           released back to the storage pool.
+        // TORCH_INTERNAL_ASSERT(!block->stream_uses.empty());
+        if (block->stream_uses.empty()) {
+          continue;
+        }
+
         insert_events(block);
       }
       needs_events_deferred_until_no_capture.clear();
@@ -1497,6 +1785,12 @@ class DeviceCachingAllocator {
       }
     }
   }
+
+  // <bojian/DynamicCUDAGraph>
+  friend void notifyMempoolEnd(
+      const int device,
+      const MempoolId_t& mempool_id,
+      const int enter_cnt);
 };
 
 class THCCachingAllocator {
@@ -1552,7 +1846,10 @@ class THCCachingAllocator {
         device,
         ": did you call init?");
     Block* block = device_allocator[device]->malloc(device, size, stream);
-    add_allocated_block(block);
+    // <bojian/DynamicCUDAGraph>
+    if (!device_allocator[device]->is_using_taped_malloc()) {
+      add_allocated_block(block);
+    }
     *devPtr = (void*)block->ptr;
   }
 
@@ -1562,7 +1859,13 @@ class THCCachingAllocator {
     }
     Block* block = get_allocated_block(ptr, true /* remove */);
     if (!block) {
-      TORCH_CHECK(false, "invalid device pointer: ", ptr);
+      // <bojian/DynamicCUDAGraph> Since we do not cache the blocks in the case
+      //                           of using taped memory allocations, it is
+      //                           possible for the queried result to be NULL
+      //                           under these circumstances.
+      //
+      // TORCH_CHECK(false, "invalid device pointer: ", ptr);
+      return;
     }
     device_allocator[block->device]->free(block);
   }
@@ -1615,6 +1918,9 @@ class THCCachingAllocator {
       return;
 
     Block* block = get_allocated_block(ptr.get());
+    if (block == nullptr) {
+      return;
+    }
     // block must not be null reaching here
     TORCH_INTERNAL_ASSERT(block != nullptr, "No allocated block can be found");
     device_allocator[block->device]->recordStream(block, stream);
@@ -1629,6 +1935,12 @@ class THCCachingAllocator {
 
     return result;
   }
+
+  // <bojian/DynamicCUDAGraph>
+  friend void notifyMempoolEnd(
+      const int device,
+      const MempoolId_t& mempool_id,
+      const int enter_cnt);
 };
 
 THCCachingAllocator caching_allocator;
@@ -1763,6 +2075,63 @@ void notifyCaptureDestroy(int device, MempoolId_t mempool_id) {
   caching_allocator.device_allocator[device]->notifyCaptureDestroy(mempool_id);
 }
 
+// <bojian/DynamicCUDAGraph> The start and the end of CUDAGraph.
+void notifyMempoolBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyMempoolBegin(
+      mempool_id, enter_cnt);
+}
+
+void notifyMempoolEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyMempoolEnd(
+      mempool_id, enter_cnt);
+
+  ska::flat_hash_map<void*, Block*>& allocated_blocks =
+      caching_allocator.allocated_blocks;
+  ska::flat_hash_set<Block*>& active_blocks_inside_memory_pool =
+      caching_allocator.device_allocator[device]
+          ->active_blocks_inside_memory_pool;
+
+  for (Block* block : active_blocks_inside_memory_pool) {
+    void* ptr_to_remove = nullptr;
+    for (std::pair<void*, Block*>& ptr_block_pair : allocated_blocks) {
+      if (ptr_block_pair.second == block) {
+        ptr_to_remove = ptr_block_pair.first;
+        break;
+      }
+    }
+    if (ptr_to_remove != nullptr) {
+      allocated_blocks.erase(ptr_to_remove);
+    }
+  }
+  active_blocks_inside_memory_pool.clear();
+}
+
+void notifyMemtapeBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyMemtapeBegin(
+      mempool_id, enter_cnt);
+}
+
+void notifyMemtapeEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyMemtapeEnd(
+      mempool_id, enter_cnt);
+}
+
 //
 // In CUDA IPC, sender sends a tensor to receiver, getIpcDevPtr
 // is called by the receiving process to map the CUDA memory from the sending
@@ -1818,7 +2187,14 @@ std::shared_ptr<void> getIpcDevPtr(std::string handle) {
   return sp;
 }
 
+static bool _logged_info_customized_cuda_caching_allocator = false;
+
 void* raw_alloc(size_t nbytes) {
+  if (!_logged_info_customized_cuda_caching_allocator) {
+    LOG(INFO)
+        << "Using customized CUDACachingAllocator. This line will only be logged once.";
+    _logged_info_customized_cuda_caching_allocator = true;
+  }
   if (nbytes == 0) {
     return nullptr;
   }
@@ -1831,6 +2207,11 @@ void* raw_alloc(size_t nbytes) {
 }
 
 void* raw_alloc_with_stream(size_t nbytes, cudaStream_t stream) {
+  if (!_logged_info_customized_cuda_caching_allocator) {
+    LOG(INFO)
+        << "Using customized CUDACachingAllocator. This line will only be logged once.";
+    _logged_info_customized_cuda_caching_allocator = true;
+  }
   if (nbytes == 0) {
     return nullptr;
   }

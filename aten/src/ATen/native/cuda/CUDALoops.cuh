@@ -42,6 +42,12 @@
 #include <c10/util/C++17.h>
 
 
+// <bojian/DynamicCUDAGraph>
+// #include <dmlc/logging.h>
+// #include <dmlc/parameter.h>
+#include <ATen/cuda/CUDAGlobalExecMask.cuh>
+
+
 #ifdef __NVCC__
 #define ASSERT_HOST_DEVICE_LAMBDA(type) \
   static_assert(__nv_is_extended_host_device_lambda_closure_type(type), \
@@ -55,7 +61,18 @@ namespace at { namespace native {
 
 template<int vec_size, typename func_t, typename array_t>
 C10_LAUNCH_BOUNDS_1(num_threads())
-__global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data) {
+__global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data
+
+    // <bojian/DynamicCUDAGraph>
+    CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
+
+) {
+
+
+  // <bojian/DynamicCUDAGraph>
+  UPDATE_GLOBAL_EXEC_MASK {
+
+
   using traits = function_traits<func_t>;
   int remaining = N - block_work_size() * blockIdx.x;
 
@@ -71,16 +88,37 @@ __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data) {
   } else {  // if this block has a full `block_work_size` data to handle, use vectorized memory access
     elementwise_kernel_helper(f, memory::policies::vectorized<vec_size, array_t>(data));
   }
+
+
+  } // <bojian/DynamicCUDAGraph>
+
+
 }
 
 template<typename func_t, typename array_t, typename inp_calc_t, typename out_calc_t, typename loader_t, typename storer_t>
 C10_LAUNCH_BOUNDS_1(num_threads())
 __global__ void unrolled_elementwise_kernel(int N, func_t f, array_t data,
-                                            inp_calc_t ic, out_calc_t oc, loader_t l, storer_t s)
+                                            inp_calc_t ic, out_calc_t oc, loader_t l, storer_t s
+                                            
+                                            // <bojian/DynamicCUDAGraph>
+                                            CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
+                                            
+                                            )
 {
+
+
+  // <bojian/DynamicCUDAGraph>
+  UPDATE_GLOBAL_EXEC_MASK {
+
+
   int remaining = N - block_work_size() * blockIdx.x;
   auto policy = memory::policies::unroll<array_t, inp_calc_t, out_calc_t, loader_t, storer_t>(data, remaining, ic, oc, l, s);
   elementwise_kernel_helper(f, policy);
+
+
+  } // <bojian/DynamicCUDAGraph>
+
+
 }
 
 // this function assume trivial 1d and no dynamic casting
@@ -92,13 +130,34 @@ static inline void launch_vectorized_kernel(int64_t N, const func_t& f, array_t 
   auto stream = at::cuda::getCurrentCUDAStream();
   int vec_size = memory::can_vectorize_up_to<func_t>(data);
 
+
+  // <bojian/DynamicCUDAGraph>
+  // if (dmlc::GetEnv("BACKTRACE_VECTORIZED_ELEMENTWISE_KERNEL", false)) {
+  //   LOG(FATAL) << "vectorized_elementwise_kernel detected";
+  // }
+
+
   switch (vec_size) {
   case 4:
-    vectorized_elementwise_kernel<4, func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data);
+    vectorized_elementwise_kernel<4, func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data
+
+
+                                                                                          // <bojian/DynamicCUDAGraph>
+                                                                                          CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+                                                                                          
+                                                                                          );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   case 2:
-    vectorized_elementwise_kernel<2, func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data);
+    vectorized_elementwise_kernel<2, func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data
+                                                                                          
+
+                                                                                          // <bojian/DynamicCUDAGraph>
+                                                                                          CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+
+                                                                                          );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   case 1: {
@@ -106,7 +165,16 @@ static inline void launch_vectorized_kernel(int64_t N, const func_t& f, array_t 
     auto output_calc = TrivialOffsetCalculator<1>();
     auto loader = memory::LoadWithoutCast();
     auto storer = memory::StoreWithoutCast();
-    unrolled_elementwise_kernel<func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data, input_calc, output_calc, loader, storer);
+    unrolled_elementwise_kernel<func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data, input_calc, output_calc, loader, storer
+    
+                                                                                     
+                                                                                     // <bojian/DynamicCUDAGraph>
+                                                                                     CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+
+                                                                                     );
+
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   }
@@ -123,13 +191,33 @@ static inline void launch_unrolled_kernel(int64_t N, const func_t& f, array_t da
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
   int64_t grid = (N + block_work_size() - 1) / block_work_size();
   auto stream = at::cuda::getCurrentCUDAStream();
-  unrolled_elementwise_kernel<func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data, ic, oc, l, s);
+  unrolled_elementwise_kernel<func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data, ic, oc, l, s
+                                                                                   
+
+                                                                                   // <bojian/DynamicCUDAGraph>
+                                                                                   CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+
+                                                                                   );
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<int nt, int vt, typename func_t>
 C10_LAUNCH_BOUNDS_2(nt, 4)
-__global__ void elementwise_kernel(int N, func_t f) {
+__global__ void elementwise_kernel(int N, func_t f
+
+
+                                   // <bojian/DynamicCUDAGraph>
+                                   CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
+
+
+                                   ) {
+
+
+  // <bojian/DynamicCUDAGraph>
+  UPDATE_GLOBAL_EXEC_MASK {
+
+
   int tid = threadIdx.x;
   int nv = nt * vt;
   int idx = nv * blockIdx.x + tid;
@@ -140,6 +228,11 @@ __global__ void elementwise_kernel(int N, func_t f) {
       idx += nt;
     }
   }
+
+
+  } // <bojian/DynamicCUDAGraph>
+
+
 }
 
 template<int nt, int vt, typename func_t>
@@ -151,7 +244,14 @@ static void launch_legacy_kernel(int64_t N, const func_t& f) {
   dim3 block(nt);
   dim3 grid((N + block.x * vt - 1) / (block.x * vt));
   auto stream = at::cuda::getCurrentCUDAStream();
-  elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f);
+  elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f
+  
+                                                                 
+                                                                 // <bojian/DynamicCUDAGraph>
+                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
+
+
+                                                                 );
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

@@ -438,6 +438,20 @@ def stream(stream: Optional['torch.cuda.Stream']) -> StreamContext:
     """
     return StreamContext(stream)
 
+
+
+# <bojian/DynamicCUDAGraph>
+# class ModuleArgsGeneratorStreamContext(StreamContext):
+#     def __enter__(self):
+#         torch._C.EnterModuleArgsGeneratorStreamContext(self.stream)
+#         super().__enter__()
+
+#     def __exit__(self, *args):
+#         super().__exit__(*args)
+#         torch._C.ExitModuleArgsGeneratorStreamContext()
+
+
+
 def set_stream(stream: Stream):
     r"""Sets the current stream.This is a wrapper API to set the stream.
         Usage of this function is discouraged in favor of the ``stream``
@@ -752,3 +766,5 @@ from . import profiler
 from . import nvtx
 from . import amp
 from . import jiterator
+# <bojian/DynamicCUDAGraph>
+from . import graphs_ext

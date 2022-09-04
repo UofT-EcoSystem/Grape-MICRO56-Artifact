@@ -145,6 +145,25 @@ C10_CUDA_API void notifyCaptureBegin(
 C10_CUDA_API void notifyCaptureEnd(int device, CaptureId_t graph_id);
 C10_CUDA_API void notifyCaptureDestroy(int device, MempoolId_t mempool_id);
 
+// <bojian/DynamicCUDAGraph>
+C10_CUDA_API void notifyMempoolBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt);
+C10_CUDA_API void notifyMempoolEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt);
+
+C10_CUDA_API void notifyMemtapeBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int entry_cnt);
+C10_CUDA_API void notifyMemtapeEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int entry_cnt);
+
 C10_CUDA_API std::mutex* getFreeMutex();
 
 C10_CUDA_API std::shared_ptr<void> getIpcDevPtr(std::string handle);
