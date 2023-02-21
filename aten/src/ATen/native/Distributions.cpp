@@ -586,19 +586,16 @@ Tensor& multinomial_out(const Tensor& self,
   if (!with_replacement) {
     // Sanity checks on `self`.
 
-
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape> Comment out the sanity checks since they require
+    // synchronization with the host side.
     // auto is_valid = ((self.max() < INFINITY) & (self.min() >= 0)).item();
     // TORCH_CHECK(
     //     is_valid.to<bool>(),
     //     "probability tensor contains either `inf`, `nan` or element < 0");
 
-
     // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     // bool zero_prob_condition;
 
-
-    // <bojian/DynamicCUDAGraph>
     // if (self.dim() == 1){
     //   zero_prob_condition = (self.sum() == 0).item().to<bool>();
     // } else {
@@ -607,7 +604,6 @@ Tensor& multinomial_out(const Tensor& self,
     // TORCH_CHECK(
     //     !zero_prob_condition,
     //     "invalid multinomial distribution (sum of probabilities <= 0)");
-
 
     // The algorithm is from gumbel softmax.
     // s = argmax( logp - log(-log(eps)) ) where eps ~ U(0, 1)

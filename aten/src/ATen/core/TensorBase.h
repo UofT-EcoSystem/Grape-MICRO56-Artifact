@@ -117,12 +117,10 @@ class TORCH_API TensorBase {
     return impl_->storage_offset();
   }
 
-
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   DeviceStorageOffsets device_storage_offsets() const {
     return impl_->device_storage_offsets();
   }
-
 
   TensorBase contiguous(MemoryFormat memory_format=MemoryFormat::Contiguous) const {
     if (is_contiguous(memory_format)) {

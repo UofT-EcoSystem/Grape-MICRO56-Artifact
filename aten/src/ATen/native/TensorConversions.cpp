@@ -7,6 +7,9 @@
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <ATen/SparseTensorUtils.h>
 
+// <bojian/Grape>
+// #include <dmlc/logging.h>
+
 namespace at {
 namespace native {
 
@@ -104,6 +107,9 @@ Tensor _to_copy(
 
   bool pin_out = (non_blocking && self.is_cuda() && options.device().is_cpu() &&
                   (options.layout() == c10::kStrided));
+
+  // <bojian/Grape>
+  // LOG(INFO) << "self.sizes()=" << self.sizes();
 
   if (memory_format == MemoryFormat::Preserve) {
     if (options.device().supports_as_strided()) {

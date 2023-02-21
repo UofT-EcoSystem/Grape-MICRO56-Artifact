@@ -13,11 +13,6 @@
 #include <cuda_runtime_api.h>
 
 
-// <bojian/DynamicCUDAGraph>
-// #include <dmlc/parameter.h>
-// #include <dmlc/logging.h>
-
-
 namespace c10 {
 namespace cuda {
 
@@ -80,16 +75,7 @@ C10_CUDA_API void __inline__ memcpy_and_sync(
   C10_CUDA_CHECK(hipMemcpyWithStream(dst, src, nbytes, kind, stream));
 #else
   C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
-
-
-  // <bojian/DynamicCUDAGraph>
-  // if (dmlc::GetEnv("CUDA_GRAPH_CAPTURE_UNDERWAY", false)) {
-  //   LOG(WARNING) << "Neglecting the stream synchronization call";
-  // } else {
-    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-  // }
-
-
+  C10_CUDA_CHECK(cudaStreamSynchronize(stream));
 #endif
 }
 

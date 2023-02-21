@@ -381,8 +381,7 @@ class C10_TensorImpl_Size_Check_Dummy_Class;
 #define TENSORIMPL_MAYBE_VIRTUAL virtual
 #endif
 
-
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
 struct DeviceStorageOffset {
   int64_t dim_size = 0;
   int64_t dim_stride = 0;
@@ -405,7 +404,6 @@ struct DeviceStorageOffsets {
     CHECK(num_offsets < C_MAX_NUM_DEVICE_STORAGE_OFFSETS);
   }
 };
-
 
 /**
  * The low-level representation of a tensor, which contains a pointer
@@ -1256,13 +1254,10 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     return storage_offset_;
   }
 
-
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   TENSORIMPL_MAYBE_VIRTUAL DeviceStorageOffsets device_storage_offsets() const {
     return device_storage_offsets_;
   }
-
-
 
  protected:
   /**
@@ -1332,8 +1327,7 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     storage_offset_ = storage_offset;
   }
 
-
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   virtual void set_device_storage_offsets(
       const DeviceStorageOffsets device_storage_offsets) {
     device_storage_offsets_ = device_storage_offsets;
@@ -1345,8 +1339,6 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     device_storage_offsets_.push(
         dim_size, dim_stride, static_cast<int64_t *>(device_index_ptr));
   }
-
-
 
   /**
    * Like set_sizes_and_strides but assumes contiguous strides.
@@ -2366,10 +2358,8 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
 
   int64_t storage_offset_ = 0;
 
-
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   DeviceStorageOffsets device_storage_offsets_;
-
 
   // If sizes and strides are empty, the numel is 1!!  However, most of the
   // time, we will immediately set sizes to {0} and reset numel to 0.
@@ -2681,10 +2671,8 @@ class C10_TensorImpl_Size_Check_Dummy_Class : private TensorImpl {
   // This is a 64-bit system
   static constexpr bool check_sizes() {
 
-
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     // constexpr size_t tsize = 26 * sizeof(int64_t);
-    
 
     // clang-format off
     are_equal<sizeof(storage_),            8,  FieldNameEnum::storage_>();
@@ -2703,11 +2691,8 @@ class C10_TensorImpl_Size_Check_Dummy_Class : private TensorImpl {
     are_equal<sizeof(device_opt_),         3,  FieldNameEnum::device_opt_>();
     are_equal<sizeof(key_set_),            8,  FieldNameEnum::key_set_>();
 
-
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     // is_le<sizeof(TensorImpl),          tsize,  FieldNameEnum::TOTAL_SIZE>();
-
-
 
     // clang-format on
 

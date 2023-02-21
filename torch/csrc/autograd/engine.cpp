@@ -1,3 +1,4 @@
+// clang-format off
 #include <torch/csrc/autograd/engine.h>
 
 #include <torch/csrc/autograd/autograd.h>
@@ -37,6 +38,9 @@
 #include <typeinfo>
 #include <sstream>
 #include <queue>
+
+// <bojian/Grape>
+#include <dmlc/logging.h>
 
 namespace torch { namespace autograd {
 
@@ -302,6 +306,24 @@ void Engine::decrement_non_reentrant_thread_count() {
   non_reentrant_device_thread_condvar_.notify_one();
 }
 
+// <bojian/Grape>
+// clang-format on
+struct ReadyQueueInspector : std::priority_queue<
+                                 NodeTask,
+                                 std::vector<NodeTask>,
+                                 ReadyQueue::CompareNodeTaskTime> {
+  static const std::vector<NodeTask>& inspect(
+      const std::priority_queue<
+          NodeTask,
+          std::vector<NodeTask>,
+          ReadyQueue::CompareNodeTaskTime>& ready_queue) {
+    return ready_queue.*&ReadyQueueInspector::c;
+  }
+};
+
+// clang-format off
+
+
 void Engine::thread_init(int device, const std::shared_ptr<ReadyQueue>& ready_queue, bool should_increment) {
   if (should_increment) {
     increment_non_reentrant_thread_count();
@@ -331,6 +353,16 @@ void Engine::thread_init(int device, const std::shared_ptr<ReadyQueue>& ready_qu
   // initialize each device thread's thread local ready queue with the ready queue
   // that is created before the thread initialization
   init_local_ready_queue(ready_queue);
+
+  // <bojian/Grape>
+  // clang-format on
+  // LOG(INFO) << "Tasks stored in the ready queue:";
+  // for (const NodeTask& task :
+  //      ReadyQueueInspector::inspect(local_ready_queue->heap_)) {
+  //   LOG(INFO) << "\t" << task.fn_.get()->name();
+  // }
+  // clang-format off
+  // </bojian/Grape>
 
   std::shared_ptr<GraphTask> graph_task = nullptr;
   thread_main(graph_task);
@@ -402,6 +434,18 @@ auto Engine::thread_main(const std::shared_ptr<GraphTask>& graph_task) -> void {
     // for reentrant execution.
     std::shared_ptr<GraphTask> local_graph_task;
     {
+      // <bojian/Grape>
+      // clang-format on
+      // LOG(INFO) << "Tasks stored in the ready queue:";
+      // for (const NodeTask& task :
+      //      ReadyQueueInspector::inspect(local_ready_queue->heap_)) {
+      //   LOG(INFO) << "\t" << task.fn_.get()->name() << ", "
+      //             << "sequence_nr=" << task.fn_->sequence_nr() << ", "
+      //             << "ReentrantDepth=" << task.getReentrantDepth();
+      // }
+      // clang-format off
+      // </bojian/Grape>
+
       // Scope this block of execution since NodeTask is not needed after this
       // block and can be deallocated (release any references to grad tensors
       // as part of inputs_).
@@ -439,6 +483,16 @@ auto Engine::thread_main(const std::shared_ptr<GraphTask>& graph_task) -> void {
                     "autograd::engine::evaluate_function: ",
                     task.fn_.get()->name()),
                 c10::ArrayRef<const c10::IValue>());
+
+            // <bojian/Grape>
+            // clang-format on
+            // LOG(INFO) << "Evaluating function=" << task.fn_.get()->name()
+            //           << ", "
+            //           << "sequence_nr=" << task.fn_->sequence_nr() << ", "
+            //           << "ReentrantDepth=" << task.getReentrantDepth();
+            // clang-format off
+            // </bojian/Grape>
+
             evaluate_function(
                 local_graph_task,
                 task.fn_.get(),
@@ -699,6 +753,7 @@ void validate_outputs(
         ss << metadata.shape();
         AT_ERROR(format_error(ss.str()));
       }
+      // <bojian/Grape> Be careful with the summation, as the global reduction can make extra memory requests.
       grad = at::sum_to(std::move(grad), metadata.shape());
     }
 

@@ -40,10 +40,8 @@
 
 #include <c10/macros/Macros.h>
 
-
-// <bojian/DynamicCUDAGraph>
-#include <ATen/cuda/CUDAGlobalExecMask.cuh>
-
+// <bojian/Grape>
+#include <ATen/cuda/CUDAGlobalIndicator.cuh>
 
 namespace {
 
@@ -916,19 +914,10 @@ __global__ void indexSelectSmallIndex(cuda::detail::TensorInfo<T, IndexType> dst
                                       int srcSelectDim,
                                       IndexType innerSize,
                                       int64_t srcSelectDimSize
-                                      
-                                      
-                                      // <bojian/DynamicCUDAGraph>
-                                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
-                                      
-                                      
-                                      ) {
-
-
-  // <bojian/DynamicCUDAGraph>
-  UPDATE_GLOBAL_EXEC_MASK {
-
-
+                                      // <bojian/Grape>
+                                      GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
+  // <bojian/Grape>
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
   // In order to avoid reloading the index that we are copying, load
   // it once to handle all of the points that are being selected, so
   // it can be reused as much as possible. This kernel is chosen when
@@ -955,11 +944,7 @@ __global__ void indexSelectSmallIndex(cuda::detail::TensorInfo<T, IndexType> dst
       dst.data[dstOffset] = src.data[srcOffset];
     }
   }
-
-
-  } // <bojian/DynamicCUDAGraph>
-
-
+  } // <bojian/Grape>
 }
 
 // We prefer this kernel to balance parallelism across index points,
@@ -1069,26 +1054,15 @@ void index_select_out_cuda_impl(
 
   int mpc = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
-
-
-// <bojian/DynamicCUDAGraph>
-// #define SMALL_INDEX(TENSOR_TYPE, INDICES_TYPE, TYPE, DST_DIM, SRC_DIM, IDX_DIM)         \
-//   indexSelectSmallIndex<TENSOR_TYPE, INDICES_TYPE, TYPE, DST_DIM, SRC_DIM, IDX_DIM>     \
-//     <<<smallIndexGrid, smallIndexBlock, 0, stream>>>(                                   \
-//       outInfo, selfInfo, indicesInfo,                                                   \
-//       outSelectDim, selfSelectDim, static_cast<TYPE>(sliceSize),                        \
-//       selfSelectDimSize);                                                               \
-//   C10_CUDA_KERNEL_LAUNCH_CHECK();
+// <bojian/Grape>
 #define SMALL_INDEX(TENSOR_TYPE, INDICES_TYPE, TYPE, DST_DIM, SRC_DIM, IDX_DIM)         \
   indexSelectSmallIndex<TENSOR_TYPE, INDICES_TYPE, TYPE, DST_DIM, SRC_DIM, IDX_DIM>     \
     <<<smallIndexGrid, smallIndexBlock, 0, stream>>>(                                   \
       outInfo, selfInfo, indicesInfo,                                                   \
       outSelectDim, selfSelectDim, static_cast<TYPE>(sliceSize),                        \
-      selfSelectDimSize \
-      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS); \
+      selfSelectDimSize                                                                 \
+      GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);                                       \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-
 
 #define LARGE_INDEX(TENSOR_TYPE, INDICES_TYPE, TYPE,                           \
                     DST_DIM, SRC_DIM, IDX_DIM, IDX_IS_MAJOR)                   \

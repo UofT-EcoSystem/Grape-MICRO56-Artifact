@@ -21,9 +21,10 @@ void initCudartBindings(PyObject* module) {
   // HIP rewrite rules from changing these names when building with HIP.
 
 #if !defined(USE_ROCM)
-  py::enum_<cudaOutputMode_t>(cudart, "cuda" "OutputMode")
-      .value("KeyValuePair", cudaKeyValuePair)
-      .value("CSV", cudaCSV);
+  // <bojian/Grape> CUDA 12 Compatibility
+  // py::enum_<cudaOutputMode_t>(cudart, "cuda" "OutputMode")
+  //     .value("KeyValuePair", cudaKeyValuePair)
+  //     .value("CSV", cudaCSV);
 #endif
 
   py::enum_<cudaError_t>(cudart, "cuda" "Error")
@@ -45,7 +46,8 @@ void initCudartBindings(PyObject* module) {
     return cudaStreamDestroy((cudaStream_t)ptr);
   });
 #if !defined(USE_ROCM)
-  cudart.def("cuda" "ProfilerInitialize", cudaProfilerInitialize);
+  // <bojian/Grape> CUDA 12 Compatibility
+  // cudart.def("cuda" "ProfilerInitialize", cudaProfilerInitialize);
 #endif
   cudart.def("cuda" "MemGetInfo", [](int device) -> std::pair<size_t, size_t> {
     c10::cuda::CUDAGuard guard(device);

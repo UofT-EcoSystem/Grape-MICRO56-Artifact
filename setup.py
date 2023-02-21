@@ -301,8 +301,19 @@ if IS_WINDOWS:
             sysconfig.get_config_var("VERSION"))
 else:
     cmake_python_library = "{}/{}".format(
-        sysconfig.get_config_var("LIBDIR"),
-        sysconfig.get_config_var("INSTSONAME"))
+        sysconfig.get_config_var("LIBDIR")
+        # <bojian/Grape> The library path in Python 3.8 does not come with the
+        # `multiarchsubdir`.
+        + (
+            sysconfig.get_config_var("multiarchsubdir")
+            if sysconfig.get_config_var("multiarchsubdir")
+            not in sysconfig.get_config_var("LIBDIR")
+            else ""
+        )
+        # </bojian/GRape>
+        ,
+        sysconfig.get_config_var("INSTSONAME"),
+    )
 cmake_python_include_dir = sysconfig.get_path("include")
 
 

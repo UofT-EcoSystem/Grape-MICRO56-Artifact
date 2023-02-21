@@ -19,9 +19,8 @@
 #include <ATen/ops/range_native.h>
 #endif
 
-// <bojian/DynamicCUDAGraph>
-#include <ATen/cuda/CUDAGlobalExecMask.cuh>
-
+// <bojian/Grape>
+#include <ATen/cuda/CUDAGlobalIndicator.cuh>
 
 #define GPU_LAMBDA __device__ __host__
 
@@ -42,19 +41,10 @@ constexpr int block_work_size = thread_work_size * num_threads();
 template<typename index_t, typename func_t>
 C10_LAUNCH_BOUNDS_1(num_threads())
 __global__ void elementwise_kernel_with_index(index_t N, func_t f, typename function_traits<func_t>::result_type *data
-
-
-    // <bojian/DynamicCUDAGraph>
-    CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
-
-
-) {
-
-
-  // <bojian/DynamicCUDAGraph>
-  UPDATE_GLOBAL_EXEC_MASK {
-
-
+                                              // <bojian/GRAPE>
+                                              GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
+  // <bojian/Grape>
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
   #pragma unroll
   for (int i = 0; i < thread_work_size; i++) {
     index_t idx = block_work_size * blockIdx.x + num_threads() * i + threadIdx.x;
@@ -62,11 +52,7 @@ __global__ void elementwise_kernel_with_index(index_t N, func_t f, typename func
       data[idx] = f(idx);
     }
   }
-
-
-  } // <bojian/DynamicCUDAGraph>
-
-
+  } // <bojian/Grape>
 }
 
 template<typename func_t>
@@ -80,20 +66,13 @@ void gpu_kernel_with_index(at::Tensor &output, func_t f) {
   using scalar_t = typename function_traits<func_t>::result_type;
   if (N <= std::numeric_limits<int>::max()) {
     elementwise_kernel_with_index<int><<<grid, num_threads(), 0, stream>>>(N, f, output.data_ptr<scalar_t>()
-    
-                                                                           // <bojian/DynamicCUDAGraph>
-                                                                           CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
-
-                                                                           );
+                                                                           // <bojian/Grape>
+                                                                           GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     elementwise_kernel_with_index<int64_t><<<grid, num_threads(), 0, stream>>>(N, f, output.data_ptr<scalar_t>()
-    
-                                                                               // <bojian/DynamicCUDAGraph>
-                                                                               CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
-    
-    
-                                                                               );
+                                                                               // <bojian/Grape>
+                                                                               GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }

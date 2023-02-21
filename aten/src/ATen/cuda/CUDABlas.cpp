@@ -15,6 +15,8 @@
 #include <cublasLt.h>
 #endif
 
+// #include <dmlc/logging.h> // <bojian/Grape>
+
 #ifdef USE_ROCM
 #define PYTORCH_ROCBLAS_VERSION_DECIMAL (ROCBLAS_VERSION_MAJOR * 100 + ROCBLAS_VERSION_MINOR)
 #define USE_GEMM_FLAGS_FP16_ALT_IMPL (PYTORCH_ROCBLAS_VERSION_DECIMAL >= 242)
@@ -538,6 +540,10 @@ void gemm<at::BFloat16>(CUDABLAS_GEMM_ARGTYPES(at::BFloat16)) {
   float fbeta = beta;
   _cublasAdjustLdLevel3(transa, transb, m, n, k, &lda, &ldb, &ldc);
   GEMM_CHECK_ARGVALUES(at::BFloat16);
+
+  // <bojian/Grape> Caution: cuBLAS's BFloat16 has memory leaks under certain
+  // input dimensions.
+
   TORCH_CUDABLAS_CHECK(cublasGemmEx(
       handle,
       opa,

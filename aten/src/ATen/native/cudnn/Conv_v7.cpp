@@ -1,3 +1,4 @@
+// clang-format off
 #include <ATen/cuda/CUDAConfig.h>  // for the definition of AT_CUDNN_ENABLED
 
 #if AT_CUDNN_ENABLED()
@@ -30,6 +31,76 @@
 #include <mutex>
 #include <stdint.h>
 #include <unordered_map>
+
+// <bojian/Grape>
+// clang-format on
+#include <dmlc/logging.h>
+
+namespace c10 {
+namespace cuda {
+namespace CUDACachingAllocator {
+
+/// @brief Track the workspace allocations.
+/// @return
+C10_CUDA_API void workspaceSizeTrackerBegin(const int tracker_mode);
+
+C10_CUDA_API void workspaceSizeTrackerEnd();
+
+static constexpr int C_WORKSPACE_SIZE_TRACKER_DEFAULT = 0;
+static constexpr int C_WORKSPACE_SIZE_TRACKER_RECORD = 1;
+static constexpr int C_WORKSPACE_SIZE_TRACKER_REPLAY = 2;
+
+static std::vector<size_t> s_tracked_workspace_sizes;
+static int s_workspace_size_tracker_mode = C_WORKSPACE_SIZE_TRACKER_DEFAULT;
+static size_t s_workspace_size_tracker_idx = 0;
+
+void workspaceSizeTrackerBegin(const int tracker_mode) {
+  s_workspace_size_tracker_mode = tracker_mode;
+  s_workspace_size_tracker_idx = 0;
+}
+
+static size_t recordOrAmendWorkspaceSize(const size_t workspace_size) {
+  if (s_workspace_size_tracker_mode == C_WORKSPACE_SIZE_TRACKER_RECORD) {
+    if (s_workspace_size_tracker_idx == s_tracked_workspace_sizes.size()) {
+      s_tracked_workspace_sizes.push_back(workspace_size);
+    } else if (
+        s_workspace_size_tracker_idx < s_tracked_workspace_sizes.size()) {
+      size_t& prev_recorded_workspace_size =
+          s_tracked_workspace_sizes[s_workspace_size_tracker_idx];
+      if (workspace_size > prev_recorded_workspace_size) {
+        LOG(INFO) << "Increasing the previously recorded workspace_size="
+                  << prev_recorded_workspace_size * 1.0 / 1024 / 1024
+                  << " (MB) to " << workspace_size * 1.0 / 1024 / 1024
+                  << " (MB)";
+        prev_recorded_workspace_size = workspace_size;
+      }
+    } else {
+      LOG(FATAL) << "Current idx=" << s_workspace_size_tracker_idx
+                 << " > tracked_workspace_sizes.size="
+                 << s_tracked_workspace_sizes.size();
+    } // if (s_workspace_size_tracker_idx == s_tracked_workspace_sizes.size())
+    s_workspace_size_tracker_idx += 1;
+  } else if (s_workspace_size_tracker_mode == C_WORKSPACE_SIZE_TRACKER_REPLAY) {
+    const size_t& prev_recorded_workspace_size =
+        s_tracked_workspace_sizes[s_workspace_size_tracker_idx];
+    s_workspace_size_tracker_idx += 1;
+    return prev_recorded_workspace_size;
+  }
+  // Directly return the requested workspace size in the case of default or
+  // recording mode.
+  return workspace_size;
+}
+
+void workspaceSizeTrackerEnd() {
+  s_workspace_size_tracker_mode = C_WORKSPACE_SIZE_TRACKER_DEFAULT;
+}
+
+} // namespace CUDACachingAllocator
+} // namespace cuda
+} // namespace c10
+
+// clang-format off
+// </bojian/Grape>
 
 // Note [behavior of cudnnFind and cudnnGet]
 // You'll notice that by default, in the ConvolutionDescriptor, we do the following:
@@ -531,6 +602,11 @@ inline Tensor allocate_workspace(size_t size, const Tensor &other) {
   // workspace fail with some 64bit indexing error instead of an OOM error. In such case,
   // we manually fail with OOM.
   TORCH_CHECK_WITH(CUDAOutOfMemoryError, size < 1_TiB, "Not enough memory for workspace!");
+
+  // <bojian/Grape>
+  // LOG(INFO) << "Allocating workspace of size=" << size * 1.0 / 1024 / 1024 << " MB";
+  size = ::c10::cuda::CUDACachingAllocator::recordOrAmendWorkspaceSize(size);
+
   return at::empty({static_cast<int64_t>(size)}, other.options().dtype(kByte));
 }
 

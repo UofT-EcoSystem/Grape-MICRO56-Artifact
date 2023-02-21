@@ -1,3 +1,4 @@
+// clang-format off
 #include <torch/csrc/python_headers.h>
 
 #include <pybind11/chrono.h>
@@ -8,14 +9,12 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
 #include <ATen/cuda/NVPMAAllocCapturer.h>
-#include <ATen/cuda/CUDAGlobalExecMask.h>
-#include <ATen/cuda/CUDAGlobalExecMask.cuh>
-#include <dmlc/parameter.h>
+#include <ATen/cuda/CUDAGlobalIndicator.h>
+#include <ATen/cuda/CUDAGlobalIndicator.cuh>
 #include <dmlc/logging.h>
-
-#include "Stream.h"
+#include <dmlc/parameter.h>
 
 // Cargo culted partially from csrc/distributed/c10d/init.cpp
 // and partially from csrc/cuda/Stream.cpp.
@@ -27,7 +26,87 @@
 template <typename T>
 using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
 
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
+// clang-format on
+
+namespace c10 {
+namespace cuda {
+namespace CUDACachingAllocator {
+
+C10_CUDA_API void notifyMempoolBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt);
+C10_CUDA_API void notifyMempoolEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt,
+    const bool force_retire_all_active_blocks);
+C10_CUDA_API void retireOutputDataPtrs(const std::vector<size_t>& output_dptrs);
+
+C10_CUDA_API void notifyPrivatePoolBegin(
+    const int device,
+    const MempoolId_t& mempool_id);
+C10_CUDA_API void notifyPrivatePoolEnd(const int device);
+
+C10_CUDA_API void notifyMemtapeBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int entry_cnt);
+C10_CUDA_API void notifyMemtapeEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int entry_cnt);
+C10_CUDA_API size_t
+getCurrentMemtapePos(const int device, const MempoolId_t& mempool_id);
+C10_CUDA_API size_t getCurrentMemtapeInReplayPos(const int device);
+C10_CUDA_API void setCurrentMemtapePos(
+    const int device,
+    const size_t num_of_mallocs_requested);
+
+C10_CUDA_API void lookupDataPtrInMemtape(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const size_t data_ptr);
+
+C10_CUDA_API void notifyCUDAGraphPlaceholdersBegin(const int device);
+C10_CUDA_API void notifyCUDAGraphPlaceholdersEnd(const int device);
+
+C10_CUDA_API void enableAliasPredictionWithVerbosity(const bool verbose);
+C10_CUDA_API void disableAliasPrediction();
+
+C10_CUDA_API void linkAllocationCtxToCUDAGraphPlaceholder(
+    const AllocationContext& alloc_ctx,
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id);
+
+/// @brief Check whether the CUDAGraph placeholder has been preemptively
+/// allocated.
+/// @return
+C10_CUDA_API void checkPreemptiveAllocation(
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id);
+
+/// @brief Clear the preemptive allocation status.
+/// @return
+C10_CUDA_API void clearPreemptiveAllocation(
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id);
+
+/// @brief Force aliasing
+/// @return
+C10_CUDA_API void fwdToCUDAGraphPlaceholdersBegin(
+    const std::vector<size_t>& placeholder_dptrs);
+
+C10_CUDA_API void fwdToCUDAGraphPlaceholdersEnd();
+
+/// @brief Track the workspace allocations.
+/// @return
+C10_CUDA_API void workspaceSizeTrackerBegin(const int tracker_mode);
+
+C10_CUDA_API void workspaceSizeTrackerEnd();
+
+} // namespace CUDACachingAllocator
+} // namespace cuda
+} // namespace c10
+
 class TensorVisitor {
  private:
   std::function<void(::at::Tensor)> _fvisit;
@@ -90,9 +169,19 @@ struct TensorArgsFlattener : public TensorVisitor {
         }) {}
 };
 
+std::ostream& operator<<(std::ostream& out, const at::DataPtr& dptr) {
+  out << "DataPtr{.alloc_ctx=" << dptr.alloc_ctx;
+  if (dptr.is_cuda_graph_placeholder) {
+    out << ", .cuda_graph_placeholder_id=" << dptr.cuda_graph_placeholder_id;
+  }
+  out << "}";
+  return out;
+}
+
 class C10_HIDDEN TensorArgsCopier : public TensorVisitor {
  private:
   py::handle _src_py_obj;
+  int _tensor_id = 0;
 
   virtual void VisitListItem(
       const py::size_t idx,
@@ -142,14 +231,38 @@ class C10_HIDDEN TensorArgsCopier : public TensorVisitor {
           at::Tensor src_tensor =
               torch::jit::toIValue(_src_py_obj, arg_type_info.type())
                   .toTensor();
+
+          using namespace ::c10::cuda::CUDACachingAllocator;
           if (src_tensor.data_ptr() != dst_tensor.data_ptr()) {
+            const at::DataPtr
+                &src_dptr =
+                    src_tensor.unsafeGetTensorImpl()->storage_.data_ptr(),
+                &dst_dptr =
+                    dst_tensor.unsafeGetTensorImpl()->storage_.data_ptr();
+            if (dst_dptr.is_cuda_graph_placeholder) {
+              // Do not perform alias prediction when the source tensor is a view
+              if (!src_tensor.is_view()) {
+                checkPreemptiveAllocation(dst_dptr.cuda_graph_placeholder_id);
+                linkAllocationCtxToCUDAGraphPlaceholder(
+                    src_dptr.alloc_ctx, dst_dptr.cuda_graph_placeholder_id);
+              }
+            }
             dst_tensor.copy_(src_tensor, true);
-          }
+          } else { // if (src_tensor.data_ptr() == dst_tensor.data_ptr())
+            const at::DataPtr& dst_dptr =
+                dst_tensor.unsafeGetTensorImpl()->storage_.data_ptr();
+            if (dst_dptr.is_cuda_graph_placeholder) {
+              clearPreemptiveAllocation(dst_tensor.unsafeGetTensorImpl()
+                                            ->storage_.data_ptr()
+                                            .cuda_graph_placeholder_id);
+            }
+          } // if (src_tensor.data_ptr() != dst_tensor.data_ptr())
+          ++_tensor_id;
         }),
         _src_py_obj(src_py_obj) {}
 };
 
-static std::vector<::at::Tensor> flatten_tensor_args(py::object tensor_args) {
+static std::vector<::at::Tensor> flattenTensorArgs(py::object tensor_args) {
   TensorArgsFlattener flattener;
   flattener(tensor_args);
   return flattener.tensor_args;
@@ -165,12 +278,13 @@ struct DependencyGraphNode {
 
 using DependencyGraphNodePtr = std::shared_ptr<DependencyGraphNode>;
 
-static void copy_tensor_args(
+static void copyTensorArgs(
+    py::object graph_placeholders,
     py::object runtime_tensor_args,
-    py::object graph_placeholders) {
+    const bool anti_aliasing) {
   // Check whether there is any internal dependency in between the tensor
   // arguments.
-  if (dmlc::GetEnv("CUDA_GRAPH_ANTI_ALIASING", false)) {
+  if (anti_aliasing) {
     TensorArgsFlattener runtime_args_flattener, placeholder_flattener;
     runtime_args_flattener(runtime_tensor_args);
     placeholder_flattener(graph_placeholders);
@@ -241,24 +355,16 @@ static void copy_tensor_args(
   } else {
     TensorArgsCopier copier(runtime_tensor_args);
     copier(graph_placeholders);
-    // TensorArgsFlattener runtime_args_flattener, placeholder_flattener;
-    // runtime_args_flattener(runtime_tensor_args);
-    // placeholder_flattener(graph_placeholders);
-
-    // for (size_t i = 0; i < runtime_args_flattener.tensor_args.size(); ++i) {
-    //   if (runtime_args_flattener.tensor_args[i].data_ptr() !=
-    //       placeholder_flattener.tensor_args[i].data_ptr()) {
-    //     LOG(INFO) << "Runtime arg_id=" << i << " has not been aligned"
-    //     placeholder_flattener.tensor_args[i].copy_(
-    //         runtime_args_flattener.tensor_args[i], true);
-    //   }
-    // }
   }
   ::at::cuda::device_synchronize();
 }
 
-// </bojian/DynamicCUDAGraph>
-
+void ChangeRLECompressionPageSize(const size_t new_page_size) {
+  LOG(INFO) << "Changing the RLE compression page size to " << new_page_size;
+  ::at::cuda::RLECompressedRegion::page_size = new_page_size;
+}
+// clang-format off
+// </bojian/Grape>
 
 void THCPGraph_init(PyObject *module) {
   // Pybind11 patch notes say "py::module_" is more up-to-date syntax,
@@ -269,26 +375,26 @@ void THCPGraph_init(PyObject *module) {
       .def("_graph_pool_handle",
            &::at::cuda::graph_pool_handle);
 
-  torch_C_m.def("_flatten_tensor_args", &flatten_tensor_args);
-  torch_C_m.def("_copy_tensor_args", &copy_tensor_args);
-
-  torch_C_m.def("_notifyMempoolBegin", &::c10::cuda::CUDACachingAllocator::notifyMempoolBegin);
-  torch_C_m.def("_notifyMempoolEnd",&::c10::cuda::CUDACachingAllocator::notifyMempoolEnd);
-
-  torch_C_m.def("_notifyMemtapeBegin", &::c10::cuda::CUDACachingAllocator::notifyMemtapeBegin);
-  torch_C_m.def("_notifyMemtapeEnd",&::c10::cuda::CUDACachingAllocator::notifyMemtapeEnd);
-
-  // torch_C_m.def("_notifyModuleArgsGeneratorBegin", &::c10::cuda::CUDACachingAllocator::notifyModuleArgsGeneratorBegin);
-  // torch_C_m.def("_notifyModuleArgsGeneratorEnd",&::c10::cuda::CUDACachingAllocator::notifyModuleArgsGeneratorEnd);
-
   shared_ptr_class_<::at::cuda::CUDAGraph>
       (torch_C_m,
        "_CUDAGraph")
 
-      // <bojian/DynamicCUDAGraph>
+      // <bojian/Grape> Add an extra indicator to indicate whether the metadata
+      // region is to be compressed or not.
       // .def(py::init<>())
-      .def(py::init<const bool>())
+      .def(py::init<const bool, const bool, const bool>())
 
+      // <bojian/Grape>
+      // clang-format on
+      .def_readwrite(
+          "subgraphs",
+          &::at::cuda::CUDAGraph::subgraphs,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "addSubgraph",
+          &::at::cuda::CUDAGraph::addSubgraph,
+          py::call_guard<py::gil_scoped_release>())
+      // clang-format off
 
       // I'm not sure this is the correct order of all the arguments. Pybind11 docs
       // aren't clear. But it works.
@@ -303,12 +409,10 @@ void THCPGraph_init(PyObject *module) {
            &::at::cuda::CUDAGraph::replay,
            py::call_guard<py::gil_scoped_release>())
 
-
-      // <bojian/DynamicCUDAGraph>
+      // <bojian/Grape>
       .def("decompress",
            &::at::cuda::CUDAGraph::decompress,
            py::call_guard<py::gil_scoped_release>())
-
 
       .def("reset",
            &::at::cuda::CUDAGraph::reset,
@@ -317,34 +421,115 @@ void THCPGraph_init(PyObject *module) {
            &::at::cuda::CUDAGraph::pool,
            py::call_guard<py::gil_scoped_release>());
 
+  // <bojian/Grape>
+  // clang-format on
+  // Tensor Arguments
+  torch_C_m.def("flattenTensorArgs", &flattenTensorArgs);
+  torch_C_m.def("copyTensorArgs", &copyTensorArgs);
 
-  // <bojian/DynamicCUDAGraph>
-  shared_ptr_class_<::at::cuda::CUDAGlobalExecMask>
-      (torch_C_m,
-       "_CUDAGlobalExecMask")
-      .def(py::init<>());
+  torch_C_m.def(
+      "_notifyPrivatePoolBegin",
+      &::c10::cuda::CUDACachingAllocator::notifyPrivatePoolBegin);
+  torch_C_m.def(
+      "_notifyPrivatePoolEnd",
+      &::c10::cuda::CUDACachingAllocator::notifyPrivatePoolEnd);
 
-  // shared_ptr_class_<::at::cuda::CUDAGraphShadowRef>
-  //     (torch_C_m,
-  //      "_CUDAGraphShadowRef")
-  //     .def(py::init<const ::at::cuda::CUDAGraph&>());
+  // Memory Pool
+  torch_C_m.def(
+      "_notifyMempoolBegin",
+      &::c10::cuda::CUDACachingAllocator::notifyMempoolBegin);
+  torch_C_m.def(
+      "_notifyMempoolEnd",
+      &::c10::cuda::CUDACachingAllocator::notifyMempoolEnd);
+  torch_C_m.def(
+      "_retireOutputDataPtrs",
+      &::c10::cuda::CUDACachingAllocator::retireOutputDataPtrs);
 
-  // shared_ptr_class_<::at::cuda::NVPMAAllocCapturer>
-  //     (torch_C_m,
-  //      "_NVPMAAllocCapturer")
-  //     .def(py::init<>())
-  //     .def("materializeCUDAGraphs",
-  //          &::at::cuda::NVPMAAllocCapturer::materializeCUDAGraphs,
-  //          py::call_guard<py::gil_scoped_release>(),
-  //          py::arg("graphs"));
-  torch_C_m.def("MaterializeCUDAGraphs",
-                &::at::cuda::NVPMAAllocCapturer::MaterializeCUDAGraphs);
+  torch_C_m.def(
+      "_notifyMemtapeBegin",
+      &::c10::cuda::CUDACachingAllocator::notifyMemtapeBegin);
+  torch_C_m.def(
+      "_notifyMemtapeEnd",
+      &::c10::cuda::CUDACachingAllocator::notifyMemtapeEnd);
+  torch_C_m.def(
+      "_getCurrentMemtapePos",
+      &::c10::cuda::CUDACachingAllocator::getCurrentMemtapePos);
+  torch_C_m.def(
+      "_getCurrentMemtapeInReplayPos",
+      &::c10::cuda::CUDACachingAllocator::getCurrentMemtapeInReplayPos);
+  torch_C_m.def(
+      "_setCurrentMemtapePos",
+      &::c10::cuda::CUDACachingAllocator::setCurrentMemtapePos);
+  torch_C_m.def(
+      "_lookupDataPtrInMemtape",
+      &::c10::cuda::CUDACachingAllocator::lookupDataPtrInMemtape);
 
-  torch_C_m.def("EnterGlobalExecMask", &::at::cuda::EnterGlobalExecMask);
-  torch_C_m.def("ExitGlobalExecMask", &::at::cuda::ExitGlobalExecMask);
-  // torch_C_m.def("EnterModuleArgsGeneratorStreamContext", &EnterModuleArgsGeneratorStreamContext);
-  // torch_C_m.def("ExitModuleArgsGeneratorStreamContext", &ExitModuleArgsGeneratorStreamContext);
+  torch_C_m.def(
+      "_notifyCUDAGraphPlaceholdersBegin",
+      &::c10::cuda::CUDACachingAllocator::notifyCUDAGraphPlaceholdersBegin);
+  torch_C_m.def(
+      "_notifyCUDAGraphPlaceholdersEnd",
+      &::c10::cuda::CUDACachingAllocator::notifyCUDAGraphPlaceholdersEnd);
 
-  // </bojian/DynamicCUDAGraph>
+  torch_C_m.def(
+      "enableAliasPredictionWithVerbosity",
+      &::c10::cuda::CUDACachingAllocator::enableAliasPredictionWithVerbosity);
+  torch_C_m.def(
+      "disableAliasPrediction",
+      &::c10::cuda::CUDACachingAllocator::disableAliasPrediction);
 
+  torch_C_m.def(
+      "fwdToCUDAGraphPlaceholdersBegin",
+      &::c10::cuda::CUDACachingAllocator::fwdToCUDAGraphPlaceholdersBegin);
+  torch_C_m.def(
+      "fwdToCUDAGraphPlaceholdersEnd",
+      &::c10::cuda::CUDACachingAllocator::fwdToCUDAGraphPlaceholdersEnd);
+
+  torch_C_m.def(
+      "_workspaceSizeTrackerBegin",
+      &::c10::cuda::CUDACachingAllocator::workspaceSizeTrackerBegin);
+  torch_C_m.def(
+      "_workspaceSizeTrackerEnd",
+      &::c10::cuda::CUDACachingAllocator::workspaceSizeTrackerEnd);
+
+  // Instantiating a list of CUDAGraph's, with compression being applied to each
+  // of their metadata.
+  torch_C_m.def(
+      "_instantiateCUDAGraphsOnCompressedMetadata",
+      &::at::cuda::instantiateCUDAGraphsOnCompressedMetadata);
+
+  torch_C_m.def(
+      "_setNVPMAAllocCapturerVerbosity",
+      &::at::cuda::NVPMAAllocCapturer::setVerbosity);
+
+  // Conditional CUDAGraphs
+  shared_ptr_class_<::at::cuda::CUDAGlobalIndicator>(
+      torch_C_m, "_CUDAGlobalIndicator")
+      .def(py::init<const bool>());
+
+  torch_C_m.def(
+      "_instantiateCUDAGraphOnDeviceV2",
+      &::at::cuda::instantiateCUDAGraphOnDeviceV2);
+  torch_C_m.def("_embedDeviceCUDAGraph", &::at::cuda::embedDeviceCUDAGraph);
+
+  torch_C_m.def("_forceMemcpy", &::at::cuda::forceMemcpy);
+  torch_C_m.def("_forceMemset", &::at::cuda::forceMemset);
+
+  torch_C_m.def(
+      "_EnterCUDAGlobalIndicatorScope",
+      &::at::cuda::EnterCUDAGlobalIndicatorScope);
+  torch_C_m.def(
+      "_ExitCUDAGlobalIndicatorScope",
+      &::at::cuda::ExitCUDAGlobalIndicatorScope);
+  torch_C_m.def(
+      "_EnterConstTrueCUDAGlobalIndicatorScope",
+      &::at::cuda::EnterConstTrueCUDAGlobalIndicatorScope);
+  torch_C_m.def(
+      "_ExitConstTrueCUDAGlobalIndicatorScope",
+      &::at::cuda::ExitConstTrueCUDAGlobalIndicatorScope);
+  torch_C_m.def(
+      "BeamHypotheses_copyDataPtr", &::at::cuda::BeamHypotheses_copyDataPtr);
+  torch_C_m.def("ChangeRLECompressionPageSize", &ChangeRLECompressionPageSize);
+  // clang-format off
+  // </bojian/Grape>
 }

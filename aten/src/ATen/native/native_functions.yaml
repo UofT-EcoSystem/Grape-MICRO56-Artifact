@@ -4069,19 +4069,16 @@
     CompositeExplicitAutograd: select
     SparseCsrCPU, SparseCsrCUDA: select_sparse_csr
 
-
-# <bojian/DynamicCUDAGraph>
+# <bojian/Grape>
 - func: select.Tensor(Tensor(a) self, int dim, Tensor val) -> Tensor(a)
   variants: function, method
   device_check: NoCheck
   device_guard: False
 
-
 - func: as_strided_w_device_storage_offset(Tensor(a) self, int[] sizes, int[] strides, int dim_size, int dim_stride, Tensor index) -> Tensor(a)
   variants: function, method
   device_check: NoCheck
   device_guard: False
-
 
 - func: select_backward(Tensor grad_output, int[] input_sizes, int dim, int index) -> Tensor
   variants: function

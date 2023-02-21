@@ -8,6 +8,9 @@
 #include <ATen/jit_macros.h>
 #include <ATen/OpMathType.h>
 
+// <bojian/Grape>
+// #include <dmlc/logging.h>
+
 namespace at { namespace native {
 
 template <typename scalar_t, typename acc_t = scalar_t, typename out_t = scalar_t>

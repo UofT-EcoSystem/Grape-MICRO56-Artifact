@@ -37,6 +37,29 @@ class CuSparseDescriptor {
   std::unique_ptr<T, CuSparseDescriptorDeleter<T, destructor>> descriptor_;
 };
 
+// <bojian/Grape> CUDA 12 Compatibility
+template <typename T, cusparseStatus_t (*destructor)(const T*)>
+struct CuSparseConstDescriptorDeleter {
+  void operator()(const T* x) {
+    if (x != nullptr) {
+      TORCH_CUDASPARSE_CHECK(destructor(x));
+    }
+  }
+};
+template <typename T, cusparseStatus_t (*destructor)(const T*)>
+class CuSparseConstDescriptor {
+ public:
+  T* descriptor() const {
+    return descriptor_.get();
+  }
+  T* descriptor() {
+    return descriptor_.get();
+  }
+
+ protected:
+  std::unique_ptr<T, CuSparseConstDescriptorDeleter<T, destructor>> descriptor_;
+};
+
 #if defined(USE_ROCM)
 // hipSPARSE doesn't define this
 using cusparseMatDescr = std::remove_pointer<cusparseMatDescr_t>::type;
@@ -97,19 +120,26 @@ class TORCH_CUDA_CPP_API CuSparseBsrsm2Info
 cusparseIndexType_t getCuSparseIndexType(const c10::ScalarType& scalar_type);
 
 class TORCH_CUDA_CPP_API CuSparseDnMatDescriptor
-    : public CuSparseDescriptor<cusparseDnMatDescr, &cusparseDestroyDnMat> {
+    // <bojian/Grape> CUDA 12 Compatibility
+    // : public CuSparseDescriptor<cusparseDnMatDescr, &cusparseDestroyDnMat> {
+    : public CuSparseConstDescriptor<cusparseDnMatDescr, &cusparseDestroyDnMat> {
  public:
   explicit CuSparseDnMatDescriptor(const Tensor& input, int64_t batch_offset = -1);
 };
 
 class TORCH_CUDA_CPP_API CuSparseDnVecDescriptor
-    : public CuSparseDescriptor<cusparseDnVecDescr, &cusparseDestroyDnVec> {
+    // <bojian/Grape> CUDA 12 Compatiblity
+    // : public CuSparseDescriptor<cusparseDnVecDescr, &cusparseDestroyDnVec> {
+    : public CuSparseConstDescriptor<cusparseDnVecDescr, &cusparseDestroyDnVec> {
  public:
   explicit CuSparseDnVecDescriptor(const Tensor& input);
 };
 
 class TORCH_CUDA_CPP_API CuSparseSpMatDescriptor
-    : public CuSparseDescriptor<cusparseSpMatDescr, &cusparseDestroySpMat> {};
+    // <bojian/Grape> CUDA 12 Compatibility
+    // : public CuSparseDescriptor<cusparseSpMatDescr, &cusparseDestroySpMat> {};
+    : public CuSparseConstDescriptor<cusparseSpMatDescr, &cusparseDestroySpMat> {};
+
 
 class TORCH_CUDA_CPP_API CuSparseSpMatCsrDescriptor
     : public CuSparseSpMatDescriptor {

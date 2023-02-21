@@ -243,7 +243,8 @@ class CheckpointValidGuard {
 
 
 struct ReadyQueue {
- private:
+// <bojian/Grape>
+//  private:
   // Returns true when t2 should be (weakly) BEFORE t1 in the queue.
   // Shutdown tasks are first and then empty NodeTask are next.
   struct CompareNodeTaskTime {
@@ -270,7 +271,8 @@ struct ReadyQueue {
 
   std::priority_queue<NodeTask, std::vector<NodeTask>, CompareNodeTaskTime> heap_;
 
- public:
+// <bojian/Grape>
+//  public:
   // incrementOutstandingTasks indicates whether or not we should increment
   // 'outstanding_tasks_' for the associated GraphTask. This should mostly
   // always be true and is only set false in certain cases (see docs for

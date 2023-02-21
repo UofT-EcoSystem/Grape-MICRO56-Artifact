@@ -1,3 +1,4 @@
+// clang-format off
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <ATen/NativeFunctions.h>
@@ -5,6 +6,9 @@
 
 #include <c10/util/intrusive_ptr.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
+
+// <bojian/Grape>
+#include <dmlc/logging.h>
 
 #include <iostream>
 #include <exception>
@@ -137,8 +141,20 @@ Tensor cached_cast(at::ScalarType to_type, const Tensor& arg, DeviceType device_
     if (can_try_cache) {
       auto it = cached_casts.find(arg.unsafeGetTensorImpl());
       if (it != cached_casts.end()) {
+
+        // <bojian/Grape>
+        // clang-format on
+        // LOG(INFO) << "Reusing the cached casts";
+        // clang-format off
+
         return std::get<1>(it->second);
       } else {
+
+        // <bojian/Grape>
+        // clang-format on
+        // LOG(INFO) << "Casting input tensors to " << to_type;
+        // clang-format off
+
         auto casted_arg = arg.to(to_type);
         cached_casts.emplace(arg.unsafeGetTensorImpl(), val_type{weakref_type(arg.getIntrusivePtr()), casted_arg});
         return casted_arg;

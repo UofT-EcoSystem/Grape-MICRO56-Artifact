@@ -8,7 +8,76 @@
 #include <c10/util/ThreadLocalDebugInfo.h>
 #include <c10/util/UniqueVoidPtr.h>
 
+// <bojian/Grape>
+#include <Python.h>
+#include <frameobject.h>
+
 namespace c10 {
+
+// <bojian/Grape>
+struct AllocationContext {
+  /// The top Python code object in which this data pointer is created.
+  PyCodeObject* f_code = nullptr;
+  /// The last instruction executed. Think of this as the line number in the
+  /// source code.
+  int f_lasti = 0;
+  /// The index of the contiguous memory requests made at the same Python
+  /// statement (i.e., same @c f_code and @c f_lasti ).
+  size_t request_id = 0;
+  DeviceIndex device_id = 0;
+  AllocationContext() = default;
+  AllocationContext(
+      PyCodeObject* const f_code,
+      const int f_lasti,
+      const size_t request_id,
+      const DeviceIndex device_id)
+      : f_code(f_code),
+        f_lasti(f_lasti),
+        request_id(request_id),
+        device_id(device_id) {}
+};
+
+inline std::ostream& operator<<(
+    std::ostream& out,
+    const AllocationContext& alloc_ctx) {
+  if (alloc_ctx.f_code == nullptr) {
+    out << "AllocationContext{<null>}";
+    return out;
+  }
+  const int __PY_LINE__ = PyCode_Addr2Line(alloc_ctx.f_code, alloc_ctx.f_lasti);
+  const char* const __PY_FILE__ =
+      PyUnicode_AsUTF8(alloc_ctx.f_code->co_filename);
+  const char* const __PY_FUNC__ = PyUnicode_AsUTF8(alloc_ctx.f_code->co_name);
+  out << "AllocationContext{ " << __PY_FILE__ << ":" << __PY_LINE__ << " ("
+      << __PY_FUNC__ << ") #"
+      << alloc_ctx.request_id
+      // printing the device index directly will cause it to be printed as char
+      // instead.
+      << ", device_id=" << static_cast<int>(alloc_ctx.device_id) << "}";
+  return out;
+}
+
+struct CUDAGraphPlaceholderId {
+  std::pair<unsigned long long, unsigned long long> mempool_id =
+      std::make_pair(0ULL, 0ULL);
+  size_t tensor_id = 0;
+  CUDAGraphPlaceholderId() = default;
+  CUDAGraphPlaceholderId(
+      const std::pair<unsigned long long, unsigned long long>& mempool_id,
+      const size_t tensor_id)
+      : mempool_id(mempool_id), tensor_id(tensor_id) {}
+};
+
+inline std::ostream& operator<<(
+    std::ostream& out,
+    const CUDAGraphPlaceholderId& cuda_graph_placehold_id) {
+  out << "CUDAGraphPlaceholderId{.mempool=("
+      << cuda_graph_placehold_id.mempool_id.first << ", "
+      << cuda_graph_placehold_id.mempool_id.second
+      << "), .tensor_id=" << cuda_graph_placehold_id.tensor_id << "}";
+  return out;
+}
+// </bojian/Grape>
 
 // A DataPtr is a unique pointer (with an attached deleter and some
 // context for the deleter) to some memory, which also records what
@@ -22,13 +91,38 @@ class C10_API DataPtr {
   c10::detail::UniqueVoidPtr ptr_;
   Device device_;
 
+  // <bojian/Grape>
+ public:
+  // Allocation Context
+  AllocationContext alloc_ctx;
+  // Whether the data pointer belongs to a CUDAGraph placeholder.
+  bool is_cuda_graph_placeholder = false;
+  CUDAGraphPlaceholderId cuda_graph_placeholder_id;
+  // </bojian/Grape>
+
  public:
   // Choice of CPU here is arbitrary; if there's an "undefined" device
   // we could use that too
   DataPtr() : ptr_(), device_(DeviceType::CPU) {}
   DataPtr(void* data, Device device) : ptr_(data), device_(device) {}
-  DataPtr(void* data, void* ctx, DeleterFnPtr ctx_deleter, Device device)
-      : ptr_(data, ctx, ctx_deleter), device_(device) {}
+  DataPtr(
+      void* data,
+      void* ctx,
+      DeleterFnPtr ctx_deleter,
+      Device device
+      // <bojian/Grape>
+      ,
+      const AllocationContext& alloc_ctx = AllocationContext(),
+      const bool is_cuda_graph_placeholder = false,
+      const CUDAGraphPlaceholderId& cuda_graph_placeholder_id =
+          CUDAGraphPlaceholderId())
+      : ptr_(data, ctx, ctx_deleter),
+        device_(device)
+        // <bojian/Grape>
+        ,
+        alloc_ctx(alloc_ctx),
+        is_cuda_graph_placeholder(is_cuda_graph_placeholder),
+        cuda_graph_placeholder_id(cuda_graph_placeholder_id) {}
   void* operator->() const {
     return ptr_.get();
   }

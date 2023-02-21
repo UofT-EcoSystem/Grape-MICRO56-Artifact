@@ -21,10 +21,9 @@
 #include <ATen/native/cuda/jit_utils.h>
 #include <iostream>
 
-
-// <bojian/DynamicCUDAGraph>
-#include "CUDAGlobalExecMask.cuh"
-
+// <bojian/Grape>
+#include <dmlc/logging.h>
+#include "CUDAGlobalIndicator.cuh"
 
 namespace at { namespace native {
 
@@ -223,19 +222,12 @@ std::ostream& operator<<(std::ostream& out, const ReduceConfig& config);
 template<int nt, int output_vec_size, typename R>
 C10_LAUNCH_BOUNDS_2(nt, 4)
 __global__ void reduce_kernel(R reduction
-
-                              // <bojian/DynamicCUDAGraph>
-                              CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS
-                              
-                              ) {
-
-  // <bojian/DynamicCUDAGraph>
-  UPDATE_GLOBAL_EXEC_MASK {
-
+                              // <bojian/Grape>
+                              GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
+  // <bojian/Grape>
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
   reduction.template run<output_vec_size>();
-
-  } // <bojian/DynamicCUDAGraph>
-
+  } // <bojian/Grape>
 }
 
 template <typename index_t>
@@ -903,29 +895,20 @@ static void launch_reduce_kernel(const ReduceConfig& config, const R& reduction)
   switch(config.output_vec_size) {
   case 4:
     reduce_kernel<max_threads / 4, 4, R><<<grid, block, shared_memory, stream>>>(reduction
-    
-                                                                                 // <bojian/DynamicCUDAGraph>
-                                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
-
-                                                                                 );
+                                                                                 // <bojian/Grape>
+                                                                                 GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   case 2:
     reduce_kernel<max_threads / 2, 2, R><<<grid, block, shared_memory, stream>>>(reduction
-    
-                                                                                 // <bojian/DynamicCUDAGraph>
-                                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
-
-                                                                                 );
+                                                                                 // <bojian/Grape>
+                                                                                 GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     break;
   default:
     reduce_kernel<max_threads / 1, 1, R><<<grid, block, shared_memory, stream>>>(reduction
-    
-                                                                                 // <bojian/DynamicCUDAGraph>
-                                                                                 CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS
-
-                                                                                 );
+                                                                                 // <bojian/Grape>
+                                                                                 GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -1229,6 +1212,14 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t id
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_CUDA_CHECK(cudaMemsetAsync(semaphores.get(), 0, config.semaphore_size(), stream));
   }
+  // <bojian/Grape> Always do memory allocations so as to align the memory
+  // tapes.
+  else {
+    auto& allocator = *c10::cuda::CUDACachingAllocator::get();
+    buffer = allocator.allocate(1);
+    semaphores = allocator.allocate(1);
+  }
+  // </bojian/Grape>
 
   AT_ASSERT(can_use_32bit_indexing);
   auto output_calc = make_output_calculator<uint32_t>(iter);

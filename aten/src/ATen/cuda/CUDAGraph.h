@@ -1,3 +1,4 @@
+// clang-format off
 #pragma once
 
 #include <ATen/Tensor.h>
@@ -5,10 +6,9 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAStream.h>
 
-
-#include "NVPMAAllocCapturer.h"  // <bojian/DynamicCUDAGraph>
-#include "NVPMAAllocCompressor.h"
-
+// <bojian/Grape>
+#include "NVCompressor.h"
+#include "NVPMAAllocCapturer.h"
 
 namespace at {
 
@@ -16,34 +16,56 @@ struct CUDAGeneratorImpl;
 
 namespace cuda {
 
+// <bojian/Grape> By default, use zero compression for the memory regions.
+using CompressedRegion_t = RLECompressedRegion;
+
 // Standalone way to get a unique mempool id usable as a pool=... argument
 // to CUDAGraph::capture_begin
 TORCH_CUDA_CPP_API MempoolId_t graph_pool_handle();
 
-
-// class CUDAGraphShadowRef;  // <bojian/DynamicCUDAGraph>
-class NVPMAAllocCapturer;
-
-
 struct TORCH_CUDA_CPP_API CUDAGraph {
-  
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
+  // clang-format on
   // CUDAGraph();
-  explicit CUDAGraph(const bool compress_metadata = false);
-
+  /// @brief Construct a CUDAGraph object.
+  /// @param postpone_instantiation Whether to postpone the graph instantiation
+  /// later (i.e., not when the capture ends). This could be helpful in the case
+  /// of device CUDAGraphs and/or metadata compression.
+  /// @param frugal_launch Whether the launch should be frugal, i.e., without
+  /// @param instantiate_on_device Whether the instantiation should happen on
+  /// the device side.
+  /// handling the random number generator.
+  explicit CUDAGraph(
+      const bool postpone_instantiation = false,
+      const bool frugal_launch = true,
+      const bool instantiate_on_device = true);
+  // clang-format off
 
   ~CUDAGraph();
 
   void capture_begin(MempoolId_t pool={0, 0});
-  void capture_end();
 
+  // <bojian/Grape>
+  // clang-format on
+  // void capture_end();
+  /// @brief Instantiate the CUDAGraph only if no exception happened during the
+  /// capture.
+  /// @param no_exception_in_capture
+  void capture_end(const bool no_exception_in_capture);
+  // clang-format off
 
-  // <bojian/DynamicCUDAGraph> Split the epilog into a different method since we
-  //                           might need to postpone it when doing the
-  //                           compression.
-  void capture_end_epilog();
+  // <bojian/Grape>
+  // clang-format on
+  /// @brief Split the epilog into a different method since we might need
+  // to postpone it when doing the compression.
+  /// @param instantiate_on_device Whether the instantiation should happen on
+  /// device.
+  void capture_end_epilog(const bool instantiate_on_device = false);
+
+  /// @brief Decompress the metadata region of the CUDAGraph.
   void decompress();
-
+  // clang-format off
+  // </bojian/Grape>
 
   void replay();
   void reset();
@@ -54,15 +76,34 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   cudaGraph_t graph_ = NULL;
   cudaGraphExec_t graph_exec_ = NULL;
 
+  // <bojian/Grape>
+  // clang-format on
+  bool _postpone_instantiation;
+  bool _frugal_launch;
+  bool _instantiate_on_device;
 
-  // <bojian/DynamicCUDAGraph>
-  // NVPMAAllocCapturer capturer_;
-  // bool capturer_materialized_ = false;
-  bool _compress_metadata = false;
-  NVPMAAllocCapturer _main_capturer, _residual_capturer;
-  ZeroCompressedPtr _zero_compressed_main_metadata,
-                    _zero_compressed_residual_metadata;
+  // Device-Side CUDAGraph
+  cudaGraph_t device_graph_ = nullptr;
+  cudaGraphExec_t device_graph_exec_ = nullptr;
 
+ public:
+  std::vector<CUDAGraph*> subgraphs;
+  void addSubgraph(CUDAGraph& subgraph) {
+    subgraphs.push_back(&subgraph);
+  }
+
+ protected:
+  // Compression-related members
+  std::shared_ptr<NVMemoryRegion> _orig_yin_main_metadata,
+      _orig_yang_main_metadata;
+  NVMemoryRegion _orig_yin_residual_metadata;
+  CompressedRegion_t _compressed_yin_residual_metadata,
+      _compressed_yang_main_metadata;
+  // std::vector<std::shared_ptr<NVMemoryRegion>> _orig_list_of_residuals;
+  std::vector<NVMemoryRegion> _orig_list_of_residuals;
+  std::vector<CompressedRegion_t> _compressed_list_of_residuals;
+  // clang-format off
+  // </bojian/Grape>
 
 #endif
 
@@ -107,12 +148,38 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   at::Tensor offset_extragraph_;
   uint64_t wholegraph_increment_;
 
-
-  // friend class CUDAGraphShadowRef;  // <bojian/DynamicCUDAGraph>
-  friend class NVPMAAllocCapturer;
-
-
+  // <bojian/Grape>
+  // clang-format on
+  friend void instantiateCUDAGraphsOnCompressedMetadata(
+      std::vector<std::reference_wrapper<CUDAGraph>>& graphs,
+      const bool debug_mode,
+      const bool instantiate_on_device,
+      const bool compress_residuals);
+  friend void embedDeviceCUDAGraph(CUDAGraph& graph, Tensor sync_barrier);
 };
+
+// <bojian/Grape>
+/// @brief Instantiate a list of CUDAGraphs.
+/// @param graphs The list of CUDAGraphs that are to be instantiated into
+/// executors
+/// @param debug_mode Whether to use instantiate in debug mode
+void instantiateCUDAGraphsOnCompressedMetadata(
+    std::vector<std::reference_wrapper<CUDAGraph>>& graphs,
+    const bool debug_mode,
+    const bool instantiate_on_device,
+    const bool compress_residuals);
+
+/// @brief Instantiate a CUDAGraph on the device side (V2). This API only
+/// instantiates but does not create the scheduling graph.
+/// @param graph The graph that is to be conditionally launched.
+void instantiateCUDAGraphOnDeviceV2(CUDAGraph& graph);
+
+/// @brief Embed a CUDAGraph on the device side.
+/// @param graph
+void embedDeviceCUDAGraph(CUDAGraph& graph, Tensor sync_barrier);
+
+// clang-format off
+// </bojian/Grape>
 
 } // namespace cuda
 } // namespace at

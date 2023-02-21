@@ -64,6 +64,10 @@ if(${USE_GLOG})
 endif()
 target_link_libraries(c10 PRIVATE fmt::fmt-header-only)
 
+# <bojian/Grape>
+target_include_directories(c10 PUBLIC ${PYTHON_INCLUDE_DIR})
+target_link_libraries(c10 PUBLIC ${PYTHON_LIBRARY})
+
 find_package(Backtrace)
 if(Backtrace_FOUND)
   target_include_directories(c10 PRIVATE ${Backtrace_INCLUDE_DIRS})

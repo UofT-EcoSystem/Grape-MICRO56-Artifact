@@ -1013,7 +1013,8 @@ elseif(USE_CUDA)
 endif()
 
 
-# <bojian/DynamicCUDAGraph>
+# <bojian/Grape> boost.filesystem is needed by the NVPMAAllocCapturer class to
+# communicate with the NVIDIA driver via the proc filesystem.
 if(USE_CUDA)
   target_link_libraries(torch_cuda PRIVATE boost_filesystem)
 endif()

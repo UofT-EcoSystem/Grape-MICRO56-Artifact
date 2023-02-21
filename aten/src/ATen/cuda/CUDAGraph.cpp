@@ -1,9 +1,12 @@
-#include <ATen/Functions.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/Exceptions.h>
+#include <ATen/Functions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
+
+// <bojian/Grape>
+#include <dmlc/logging.h>
 
 namespace at {
 namespace cuda {
@@ -43,20 +46,18 @@ MempoolId_t graph_pool_handle() {
  */
 
 CUDAGraph::CUDAGraph(
-    // <bojian/DynamicCUDAGraph>
-    const bool compress_metadata)
-    // CUDAStreams may not be default-constructed.
-    : capture_stream_(at::cuda::getCurrentCUDAStream()) {
+    // <bojian/Grape>
+    const bool postpone_instantiation,
+    const bool frugal_launch,
+    const bool instantiate_on_device)
+  // CUDAStreams may not be default-constructed.
+  : capture_stream_(at::cuda::getCurrentCUDAStream()) {
 #if (defined(CUDA_VERSION) && CUDA_VERSION < 11000) || defined(USE_ROCM)
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
-
-  // <bojian/DynamicCUDAGraph>
-  // LOG(WARNING) << "Constructor invoked";
-  _compress_metadata = compress_metadata;
-  // if (_compress_metadata) {
-  //   LOG(WARNING) << "CUDAGraph's metadata is configured to be compressed";
-  // }
+  _postpone_instantiation = postpone_instantiation;
+  _frugal_launch = frugal_launch;
+  _instantiate_on_device = instantiate_on_device;
 }
 
 void CUDAGraph::capture_begin(MempoolId_t pool/*=0*/) {
@@ -133,7 +134,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*=0*/) {
 #endif
 }
 
-void CUDAGraph::capture_end() {
+void CUDAGraph::capture_end(const bool no_exception_in_capture) {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -146,34 +147,42 @@ void CUDAGraph::capture_end() {
   TORCH_CHECK(graph_ != NULL, "Invalid capture.");
   has_graph_ = true;
 
-  // <bojian/DynamicCUDAGraph>
-  // capturer_.setToRecordNextMalloc();
-  if (_compress_metadata) {
+  // <bojian/Grape>
+  if (_postpone_instantiation) {
     // Directly exit if compressing the metadata, since we will be materializing
     // the executors later.
-
-    LOG(INFO) << "Skipping the instantiation of graph=" << graph_
-              << " since it is to be compressed";
-
+    // LOG(INFO) << "Postponing the instantiation of graph=" << graph_
+    //           << " to later stages";
     return;
   }
+  // Split the epilog into a different method since we might need to postpone it
+  // when doing the compression.
 
-
-  // <bojian/DynamicCUDAGraph> Split the epilog into a different method since we
-  //                           might need to postpone it when doing the
-  //                           compression.
-  capture_end_epilog();
-
-
+  // <bojian/Grape> Only instantiate if there is no exception during the capture.
+  if (no_exception_in_capture) {
+    capture_end_epilog(_instantiate_on_device);
+  } else {
+    LOG(WARNING) << "Not instantiating due to an exception "
+                    "that happened during the capture";
+  }
 }
 
-
-// <bojian/DynamicCUDAGraph>
-void CUDAGraph::capture_end_epilog() {
+// <bojian/Grape>
+void CUDAGraph::capture_end_epilog(const bool instantiate_on_device) {
   // Trailing NULL, NULL, 0 arguments were recommended by Cuda driver people,
   // who prefer not to report error message through these arguments moving forward
   // (they prefer return value, or errors on api calls internal to the capture)
-  AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+  // <bojian/Grape>
+  // AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+  if (instantiate_on_device) {
+    // LOG(INFO) << "Instantiating the CUDAGraph on the device side";
+    AT_CUDA_CHECK(cudaGraphInstantiate(
+        &graph_exec_, graph_, cudaGraphInstantiateFlagDeviceLaunch));
+    AT_CUDA_CHECK(cudaGraphUpload(graph_exec_, ::at::cuda::getCurrentCUDAStream()));
+  } else {
+    AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+  }
+  // </bojian/Grape>
   has_graph_exec_ = true;
 
   auto* gen = get_generator_or_default<CUDAGeneratorImpl>(
@@ -186,33 +195,44 @@ void CUDAGraph::capture_end_epilog() {
 
   // Now that we've instantiated graph_ into graph_exec_,
   // we don't need graph_ anymore.
-  AT_CUDA_CHECK(cudaGraphDestroy(graph_));
-  has_graph_ = false;
+
+  // <bojian/Graph> Comment out the destruction of the original graph data
+  // structure since it might be useful for debugging purposes
+  // AT_CUDA_CHECK(cudaGraphDestroy(graph_));
+  // has_graph_ = false;
+
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
 }
 
-
-// <bojian/DynamicCUDAGraph>
-extern struct DecompressEngine gDecompressEngine;
-
+// <bojian/Grape>
 void CUDAGraph::decompress() {
-  if (_compress_metadata) {
-    _main_capturer.deflateZeros(_zero_compressed_main_metadata);
-    if (_residual_capturer.shadow_ptr() != nullptr) {
-      _residual_capturer.deflateZeros(_zero_compressed_residual_metadata);
+  for (CUDAGraph* const subgraph : subgraphs) {
+    subgraph->decompress();
+  }
+  if (_orig_yang_main_metadata != nullptr) {
+    for (size_t residual_id = 0; residual_id < _orig_list_of_residuals.size();
+         ++residual_id) {
+      gCompressEngine.decompress(
+          _compressed_list_of_residuals[residual_id],
+          _orig_list_of_residuals[residual_id]);
     }
-    checkCudaErrors(cudaStreamSynchronize(gDecompressEngine.stream));
+    gCompressEngine.decompress(
+        _compressed_yin_residual_metadata, _orig_yin_residual_metadata);
+    gCompressEngine.decompress(
+        _compressed_yang_main_metadata, *_orig_yang_main_metadata);
+    gCompressEngine.waitForAllWorkitems();
   }
 }
-// </bojian/DynamicCUDAGraph>
-
 
 void CUDAGraph::replay() {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
   TORCH_CHECK(has_graph_exec_,
               "Called CUDAGraph::replay without a preceding successful capture.");
+
+  // <bojian/Grape> Do not manipulate the RNG engine in the case of frugality.
+  if (!_frugal_launch) {
 
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
@@ -226,26 +246,8 @@ void CUDAGraph::replay() {
   }
   offset_extragraph_.fill_(int64_t(rng_engine_inputs.offset_.val));
 
-  // checkCudaErrors(cudaDeviceSynchronize());
-
   // graph_exec_ may be replayed in any stream.
   AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
-
-  // <bojian/DynamicCUDAGraph>
-  // if (!capturer_materialized_) {
-  //   capturer_.materialize();
-  //   capturer_.dump(
-  //       "cuda_graph-uuid_" + std::to_string((id_ - 1) / 3),
-  //       /*as_plain_text=*/true);
-  //   capturer_materialized_ = true;
-  // }
-
-  // AT_CUDA_CHECK(cudaDeviceSynchronize());
-  // if (cudaDeviceSynchronize() != cudaSuccess) {
-  //   cudaGetLastError();
-  //   LOG(WARNING) << "Neglecting the error from the graph launch call";
-  // }
-
 
   int version;
   AT_CUDA_CHECK(cudaDriverGetVersion(&version));
@@ -259,6 +261,15 @@ void CUDAGraph::replay() {
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
+
+  // <bojian/Grape>
+  } // if (!_frugal_launch)
+  else {
+    AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  }
+  // Reset the contiguous counter every time a CUDAGraph is executed.
+  ::c10::cuda::CUDACachingAllocator::resetAllocationContextContigCnt();
+  // </bojian/Grape>
 }
 
 void CUDAGraph::reset() {
@@ -292,6 +303,15 @@ void CUDAGraph::reset() {
   if (has_graph_exec_) {
     C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
   }
+
+  // <bojian/Grape> Add the cleanup for the device CUDAGraph.
+  // if (device_graph_) {
+  //   C10_CUDA_CHECK_WARN(cudaGraphDestroy(device_graph_));
+  // }
+  // if (device_graph_exec_) {
+  //   C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(device_graph_exec_));
+  // }
+
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif

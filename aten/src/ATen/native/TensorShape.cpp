@@ -24,11 +24,6 @@
 #include <c10/util/Optional.h>
 #include <c10/util/SmallVector.h>
 
-
-// <bojian/DynamicCUDAGraph>
-#include <dmlc/logging.h>
-
-
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -1313,11 +1308,8 @@ QuantizerPtr create_subtensor_quantizer(const Tensor& self, bool is_select, int6
   return quantizer;
 }
 
-
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
 Tensor select(const Tensor& self, int64_t dim, const Tensor& index) {
-  // LOG(INFO) << "Invoking the customized select function with index=" << index;
-
   int64_t ndim = self.dim();
   dim = maybe_wrap_dim(dim, ndim);
 
@@ -1331,8 +1323,6 @@ Tensor select(const Tensor& self, int64_t dim, const Tensor& index) {
       self.as_strided_w_device_storage_offset(sizes, strides, dim_size, dim_stride, index);
   namedinference::propagate_names_except(result, self, {dim});
   return result;
-
-  // return self;
 }
 
 Tensor as_strided_w_device_storage_offset(
@@ -1355,8 +1345,6 @@ Tensor as_strided_w_device_storage_offset(
   }
   return result;
 }
-
-
 
 Tensor select(const Tensor& self, int64_t dim, int64_t index) {
   int64_t ndim = self.dim();

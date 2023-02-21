@@ -13,12 +13,9 @@
 
 #include <ATen/core/List.h>
 
-
-// <bojian/DynamicCUDAGraph>
-#include <dmlc/parameter.h>
+// <bojian/Grape>
 #include <dmlc/logging.h>
-
-
+#include <dmlc/parameter.h>
 
 namespace at {
 namespace indexing {
@@ -242,16 +239,13 @@ static inline Tensor applySelect(
   return self.select(dim, index);
 }
 
-
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
 static inline Tensor applySelect(
     const Tensor& self,
     int64_t dim,
     const Tensor& index) {
   return self.select(dim, index);
 }
-
-
 
 static inline Tensor boolToIndexingTensorCPUOrCUDA(const Tensor& self, bool value) {
   // booleans add a dimension of size 1. true indexes this dimension as if 0:, false as empty.
@@ -424,14 +418,12 @@ static inline Tensor handleDimInMultiDimIndexing(
     if (tensor.dim() == 0 && at::isIntegralType(scalar_type, /*includeBool=*/true)) {
       if (scalar_type != at::kByte && scalar_type != at::kBool) {
 
-
-        // <bojian/DynamicCUDAGraph>
-        if (dmlc::GetEnv("CUDA_GRAPH_REWRITE_FOR_COMPAT", false)) {
+        // <bojian/Grape>
+        if (dmlc::GetEnv("GRAPE_REWRITE_FOR_CUDA_GRAPH_COMPAT", false)) {
           result = impl::applySelect(result, *dim_ptr, tensor);
         } else {
           result = impl::applySelect(result, *dim_ptr, tensor.item<int64_t>(), real_dim, original_tensor_device, prev_dim_result_sizes);
         }
-
 
       } else {
         result = result.unsqueeze(*dim_ptr);

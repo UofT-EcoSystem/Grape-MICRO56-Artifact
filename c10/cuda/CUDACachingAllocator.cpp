@@ -9,11 +9,6 @@
 #include <c10/util/irange.h>
 #include <c10/util/llvmMathExtras.h>
 
-// <bojian/DynamicCUDAGraph>
-#include <dmlc/logging.h>
-#include <dmlc/parameter.h>
-#include <iostream>
-
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <bitset>
@@ -26,12 +21,103 @@
 #include <set>
 #include <vector>
 
+// <bojian/Grape>
+#include <iostream>
+
+#include <dmlc/logging.h>
+#include <dmlc/parameter.h>
+
+#define GRAPE_DEBUG_ALLOCATION_CONTEXT 0
+// </bojian/Grape>
+
 namespace c10 {
 
 C10_DEFINE_REGISTRY(FreeCudaMemoryCallbacksRegistry, FreeMemoryCallback);
 
 namespace cuda {
 namespace CUDACachingAllocator {
+
+C10_CUDA_API void notifyMempoolBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt);
+C10_CUDA_API void notifyMempoolEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int enter_cnt,
+    const bool force_exit_all_active_blocks);
+C10_CUDA_API void retireOutputDataPtrs(const std::vector<size_t>& output_dptrs);
+
+C10_CUDA_API void notifyPrivatePoolBegin(
+    const int device,
+    const MempoolId_t& mempool_id);
+C10_CUDA_API void notifyPrivatePoolEnd(const int device);
+
+C10_CUDA_API void notifyMemtapeBegin(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int entry_cnt);
+C10_CUDA_API void notifyMemtapeEnd(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const int entry_cnt);
+C10_CUDA_API size_t
+getCurrentMemtapePos(const int device, const MempoolId_t& mempool_id);
+C10_CUDA_API size_t getCurrentMemtapeInReplayPos(const int device);
+C10_CUDA_API void setCurrentMemtapePos(
+    const int device,
+    const size_t num_of_mallocs_requested);
+
+C10_CUDA_API void lookupDataPtrInMemtape(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const size_t data_ptr);
+
+C10_CUDA_API void notifyCUDAGraphPlaceholdersBegin(const int device);
+C10_CUDA_API void notifyCUDAGraphPlaceholdersEnd(const int device);
+
+C10_CUDA_API void enableAliasPredictionWithVerbosity(const bool verbose);
+C10_CUDA_API void disableAliasPrediction();
+
+C10_CUDA_API void linkAllocationCtxToCUDAGraphPlaceholder(
+    const AllocationContext& alloc_ctx,
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id);
+
+/// @brief Check whether the CUDAGraph placeholder has been preemptively
+/// allocated.
+/// @return
+C10_CUDA_API void checkPreemptiveAllocation(
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id);
+
+/// @brief Clear the preemptive allocation status.
+/// @return
+C10_CUDA_API void clearPreemptiveAllocation(
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id);
+
+C10_CUDA_API void fwdToCUDAGraphPlaceholdersBegin(
+    const std::vector<size_t>& placeholder_dptrs);
+
+C10_CUDA_API void fwdToCUDAGraphPlaceholdersEnd();
+
+/// @brief Get the current Python frame.
+/// @return A pair, of which the first element if the current Python code object
+/// and the second element is the current line number.
+inline std::pair<PyCodeObject*, int> getCurrentPyFrame() {
+  PyInterpreterState* py_main_interpreter_state = PyInterpreterState_Main();
+  PyThreadState *py_thread_state =
+                    PyInterpreterState_ThreadHead(py_main_interpreter_state),
+                *py_next_thread_state = nullptr;
+  // keep unwrapping until the last thread state
+  while ((py_next_thread_state = PyThreadState_Next(py_thread_state)) !=
+         nullptr) {
+    py_thread_state = py_next_thread_state;
+  }
+  if (py_thread_state->frame == nullptr) {
+    return std::make_pair(nullptr, 0);
+  }
+  return std::make_pair(
+      py_thread_state->frame->f_code, py_thread_state->frame->f_lasti);
+}
 
 //
 // Yet another caching allocator for CUDA device allocations.
@@ -259,12 +345,23 @@ struct AllocParams {
       cudaStream_t stream,
       BlockPool* pool,
       size_t alloc_size,
-      DeviceStats& stats)
+      DeviceStats& stats
+#if GRAPE_DEBUG_ALLOCATION_CONTEXT
+      ,
+      AllocationContext alloc_ctx
+#endif
+      )
       : search_key(device, stream, size),
         pool(pool),
         alloc_size(alloc_size),
         block(nullptr),
-        err(cudaSuccess) {}
+        err(cudaSuccess)
+#if GRAPE_DEBUG_ALLOCATION_CONTEXT
+        ,
+        alloc_ctx(alloc_ctx)
+#endif
+  {
+  }
 
   int device() const {
     return search_key.device;
@@ -282,13 +379,16 @@ struct AllocParams {
   Block* block;
   StatTypes stat_types = {false};
   cudaError_t err;
+#if GRAPE_DEBUG_ALLOCATION_CONTEXT
+  AllocationContext alloc_ctx;
+#endif
 
   friend std::ostream& operator<<(
       std::ostream& out,
       const AllocParams& alloc_params);
 };
 
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
 std::ostream& operator<<(std::ostream& out, const Block* const block) {
   if (!block) {
     out << "<NullBlock>";
@@ -317,12 +417,15 @@ std::ostream& operator<<(std::ostream& out, const AllocParams& alloc_params) {
       << "\t.stream=" << alloc_params.stream() << "\n"
       << "\t.size=" << format_size(alloc_params.size()) << "\n"
       << "\t.pool=" << alloc_params.pool << "\n"
-      << "\t.alloc_size=" << format_size(alloc_params.alloc_size)
-      << "\n"
-      // Cannot log the block here since it is possible for the block to be
-      // released by `try_merge_block` function call.
-      //
-      // << "\t.block=" << alloc_params.block << "\n"
+      << "\t.alloc_size=" << format_size(alloc_params.alloc_size) << "\n"
+  // Cannot log the block here since it is possible for the block to be
+  // released by `try_merge_block` function call, in which case the `block`
+  // will be not null but pointing to an invalid value.
+  //
+  // << "\t.block=" << alloc_params.block << "\n"
+#if GRAPE_DEBUG_ALLOCATION_CONTEXT
+      << "\t.alloc_ctx=" << alloc_params.alloc_ctx << "\n"
+#endif
       << "}";
 
   return out;
@@ -333,6 +436,7 @@ std::ostream& operator<<(std::ostream& out, const MempoolId_t& mempool_id) {
       << ", graph_pool_handle=" << mempool_id.second << "}";
   return out;
 }
+// </bojian/Grape>
 
 // CUDA graphs helper
 struct PrivatePool {
@@ -501,7 +605,7 @@ class DeviceCachingAllocator {
   // whether they came from graph_pools or one of the BlockPools above.
   ska::flat_hash_set<Block*> active_blocks;
 
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   ska::flat_hash_set<Block*> active_blocks_inside_memory_pool;
 
   // captures_underway tracks if a capture might be underway on any stream.
@@ -539,13 +643,40 @@ class DeviceCachingAllocator {
   // in case we want multiple captures to share the same pool
   ska::flat_hash_map<CaptureId_t, MempoolId_t> capture_to_pool_map;
 
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   ska::flat_hash_map<
       MempoolId_t,
       std::vector<std::pair<AllocParams, Block>>,
       MempoolIdHash>
       taped_alloc_params_with_block_copy;
   MempoolId_t current_mempool_id;
+
+ public:
+  /// @brief Get the current memory pool ID, needed by the alias prediction.
+  /// @return
+  MempoolId_t getCurrentMempoolId() const {
+    return current_mempool_id;
+  }
+
+  /// @brief Get whether the allocator is taping memory allocations.
+  /// @return
+  bool isTapingMalloc() const {
+    return taping_malloc;
+  }
+
+  /// @brief Get the current position in the memory tape.
+  /// @return
+  size_t getCurrentMallocID() const {
+    if (taping_malloc) {
+      return taped_alloc_params_with_block_copy.at(current_mempool_id).size() -
+          1;
+    } else if (using_taped_malloc) {
+      return num_of_mallocs_requested - 1;
+    }
+    LOG(FATAL) << "Cannot query the malloc ID when not taping";
+  }
+
+ private:
   std::stack<MempoolId_t> outer_scope_mempool_ids;
   size_t num_of_mallocs_requested = 0, num_of_extra_mallocs_requested = 0;
   bool taping_malloc = false, using_taped_malloc = false;
@@ -560,6 +691,9 @@ class DeviceCachingAllocator {
           .emplace_back(alloc_params, *block);
     }
   }
+
+  bool allocating_cuda_graph_placeholders = false;
+  // </bojian/Grape>
 
  public:
   DeviceCachingAllocator()
@@ -590,10 +724,31 @@ class DeviceCachingAllocator {
 
     size = round_size(size);
     auto& pool = get_pool(size, stream);
+#if GRAPE_DEBUG_ALLOCATION_CONTEXT
+    std::pair<PyCodeObject*, int> current_py_frame = getCurrentPyFrame();
+    AllocationContext alloc_ctx(
+        current_py_frame.first, current_py_frame.second, 0, device);
+#endif
     const size_t alloc_size = get_allocation_size(size);
-    AllocParams params(device, size, stream, &pool, alloc_size, stats);
+    AllocParams params(
+        device,
+        size,
+        stream,
+        &pool,
+        alloc_size,
+        stats
+#if GRAPE_DEBUG_ALLOCATION_CONTEXT
+        ,
+        alloc_ctx
+#endif
+    );
+
     params.stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
     params.stat_types[static_cast<size_t>(get_stat_type_for_pool(pool))] = true;
+
+    // <bojian/Grape>
+    // LOG(INFO) << "alloc_params=" << params
+    //           << ", [bt]=" << dmlc::StackTrace(1, 25);
 
     // First, try to get a block from the existing pool.
     bool block_found =
@@ -694,8 +849,8 @@ class DeviceCachingAllocator {
     Block* remaining = nullptr;
 
     const bool already_split = block->is_split();
-    // <bojian/DynamicCUDAGraph> Do not split the memory blocks in the case of
-    //                           using the taped memory allocations.
+    // <bojian/Grape> Do not split the memory blocks in the case of using the
+    // taped memory allocations.
     if (should_split(block, size) && !using_taped_malloc) {
       remaining = block;
 
@@ -734,12 +889,12 @@ class DeviceCachingAllocator {
 
     block->allocated = true;
 
-    // <bojian/DynamicCUDAGraph> Do NOT insert into the active_blocks in the
-    //                           case of using taped memory allocations.
+    // <bojian/Grape> Do NOT insert into the active_blocks in the case of using
+    // taped memory allocations.
     if (!using_taped_malloc) {
       bool inserted = active_blocks.insert(block).second;
 
-      // <bojian/DynamicCUDAGraph>
+      // <bojian/Grape>
       if (inside_memory_pool) {
         active_blocks_inside_memory_pool.insert(block);
       }
@@ -762,7 +917,7 @@ class DeviceCachingAllocator {
         stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         c10::Device(c10::DeviceType::CUDA, device));
 
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     tape_alloc_params(params, block);
 
     return block;
@@ -1015,7 +1170,7 @@ class DeviceCachingAllocator {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     captures_underway++;
 
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     if (inside_memory_pool) {
       auto it = graph_pools.find(mempool_id);
       TORCH_INTERNAL_ASSERT(it != graph_pools.end());
@@ -1030,6 +1185,7 @@ class DeviceCachingAllocator {
                 << " with current_mempool_id=" << current_mempool_id;
       mempool_id = current_mempool_id;
     }
+    // </bojian/Grape>
 
     auto it = graph_pools.find(mempool_id);
     if (it == graph_pools.end()) {
@@ -1084,7 +1240,28 @@ class DeviceCachingAllocator {
     }
   }
 
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
+  void notifyPrivatePoolBegin(MempoolId_t mempool_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    // captures_underway++;
+
+    if ((taping_malloc || using_taped_malloc) &&
+        (mempool_id != current_mempool_id)) {
+      LOG(INFO) << "Overwriting mempool_id=" << mempool_id
+                << " with current_mempool_id=" << current_mempool_id;
+      mempool_id = current_mempool_id;
+    }
+    auto it = graph_pools.find(mempool_id);
+    if (it == graph_pools.end()) {
+      graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>());
+    } else {
+      TORCH_INTERNAL_ASSERT(it->second->use_count > 0);
+      it->second->use_count++;
+    }
+  }
+
+  void notifyPrivatePoolEnd() {}
+
   bool is_using_taped_malloc() const {
     return using_taped_malloc;
   }
@@ -1095,7 +1272,7 @@ class DeviceCachingAllocator {
 
     auto it = graph_pools.find(mempool_id);
     if (enter_cnt) {
-      report_memory_leaks = dmlc::GetEnv("MEMPOOL_REPORT_MEMORY_LEAKS", true);
+      report_memory_leaks = dmlc::GetEnv("GRAPE_REPORT_MEMORY_LEAKS", true);
     }
     if (it == graph_pools.end()) {
       graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>());
@@ -1105,20 +1282,28 @@ class DeviceCachingAllocator {
     }
   }
 
-  void notifyMempoolEnd(const MempoolId_t& mempool_id, const int enter_cnt) {
+  void notifyMempoolEnd(
+      const MempoolId_t& mempool_id,
+      const int enter_cnt,
+      const bool force_retire_all_active_blocks) {
     // First set the inside_memory_pool flag to false, otherwise we will be
     // modifying active_blocks_inside_memory_pool during the traversal.
     inside_memory_pool = false;
     if (enter_cnt) {
       report_memory_leaks = false;
     }
-    // Retire all the blocks of active_blocks_inside_memory_pool.
-    for (Block* block : active_blocks_inside_memory_pool) {
-      free(block);
+    // Retire all the blocks that are active.
+    //
+    // Note that we are no longer doing this since it is too dangerous and often
+    // leads to unpredicted runtime behavior.
+
+    if (force_retire_all_active_blocks) {
+      for (Block* block : active_blocks_inside_memory_pool) {
+        free(block);
+      }
     }
   }
 
-  // <bojian/DynamicCUDAGraph>
   void notifyMemtapeBegin(const MempoolId_t& mempool_id, const int enter_cnt) {
     outer_scope_mempool_ids.push(current_mempool_id);
     current_mempool_id = mempool_id;
@@ -1176,6 +1361,17 @@ class DeviceCachingAllocator {
     outer_scope_inside_memory_pool_flags.pop();
   }
 
+  void notifyCUDAGraphPlaceholdersBegin() {
+    allocating_cuda_graph_placeholders = true;
+  }
+  void notifyCUDAGraphPlaceholdersEnd() {
+    allocating_cuda_graph_placeholders = false;
+  }
+  bool isAllocatingCUDAGraphPlaceholders() const {
+    return allocating_cuda_graph_placeholders;
+  }
+  // </bojian/Grape>
+
  private:
   // All private methods do not acquire the allocator mutex.
 
@@ -1201,7 +1397,7 @@ class DeviceCachingAllocator {
 
   /** moves a block into a pool of cached free blocks */
   void free_block(Block* block) {
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     if (using_taped_malloc) {
       return;
     }
@@ -1227,7 +1423,7 @@ class DeviceCachingAllocator {
 
     active_blocks.erase(block);
 
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     if (inside_memory_pool) {
       active_blocks_inside_memory_pool.erase(block);
     }
@@ -1291,7 +1487,7 @@ class DeviceCachingAllocator {
   BlockPool& get_pool(size_t size, cudaStream_t stream) {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
 
-    // <bojian/DynamicCUDAGraph>
+    // <bojian/Grape>
     if (inside_memory_pool) {
       auto it = graph_pools.find(current_mempool_id);
       TORCH_INTERNAL_ASSERT(it != graph_pools.end());
@@ -1301,6 +1497,19 @@ class DeviceCachingAllocator {
         return it->second->large_blocks;
       }
     }
+    if (taping_malloc) {
+      // Enter the private pool if there is one available when taping the memory
+      // allocations.
+      auto graph_pool_it = graph_pools.find(current_mempool_id);
+      if (graph_pool_it != graph_pools.end()) {
+        if (size <= kSmallSize) {
+          return graph_pool_it->second->small_blocks;
+        } else {
+          return graph_pool_it->second->large_blocks;
+        }
+      }
+    }
+    // </bojian/Grape>
 
     // captures_underway is a conservative guess that the current stream may be
     // capturing. It's only > 0 if some thread has begun and not yet ended a
@@ -1359,8 +1568,7 @@ class DeviceCachingAllocator {
   }
 
   bool get_free_block(AllocParams& p) {
-    // <bojian/DynamicCUDAGraph> Check whether a taped memory allocation is
-    //                           available.
+    // <bojian/Grape> Check whether a taped memory allocation is available.
     if (using_taped_malloc) {
       while (true) {
         try {
@@ -1372,9 +1580,9 @@ class DeviceCachingAllocator {
               past_alloc_params_with_block_copy.first;
           if (p.device() != past_alloc_params.device() ||
               p.size() > past_alloc_params.size()) {
-            LOG(WARNING)
-                << "Unable to reuse taped allocation parameters, taped="
-                << past_alloc_params << " vs. requested=" << p;
+            LOG(INFO) << dmlc::StackTrace(1, 75);
+            LOG(FATAL) << "Unable to reuse taped allocation parameters, taped="
+                       << past_alloc_params << " vs. requested=" << p;
           } else {
             // if (p.stream() != past_alloc_params.stream()) {
             //   LOG(WARNING) << "Different streams of taped="
@@ -1412,7 +1620,7 @@ class DeviceCachingAllocator {
     }
     auto it = pool.blocks.lower_bound(&p.search_key);
     if (it == pool.blocks.end() || (*it)->stream != p.stream()) {
-      // <bojian/DynamicCUDAGraph>
+      // <bojian/Grape>
       // if (it != pool.blocks.end() && (*it)->stream != p.stream()) {
       //   LOG(WARNING)
       //       << "Detected a reusable block but it belongs to a different
@@ -1722,8 +1930,8 @@ class DeviceCachingAllocator {
   void insert_events_deferred_until_no_capture() {
     if (C10_UNLIKELY(needs_events_deferred_until_no_capture.size() > 0)) {
       for (auto* block : needs_events_deferred_until_no_capture) {
-        // <bojian/DynamicCUDAGraph> It is possible that the block is already
-        //                           released back to the storage pool.
+        // <bojian/Grape> It is possible that the block is already released back
+        // to the storage pool.
         // TORCH_INTERNAL_ASSERT(!block->stream_uses.empty());
         if (block->stream_uses.empty()) {
           continue;
@@ -1786,11 +1994,21 @@ class DeviceCachingAllocator {
     }
   }
 
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   friend void notifyMempoolEnd(
       const int device,
       const MempoolId_t& mempool_id,
-      const int enter_cnt);
+      const int enter_cnt,
+      const bool force_retire_all_active_blocks);
+  friend size_t getCurrentMemtapePos(
+      const int device,
+      const MempoolId_t& mempool_id);
+  friend size_t getCurrentMemtapeInReplayPos(const int device);
+  friend void setCurrentMemtapePos(const int device, const size_t);
+  friend void lookupDataPtrInMemtape(
+      const int device,
+      const MempoolId_t& mempool_id,
+      const size_t data_ptr);
 };
 
 class THCCachingAllocator {
@@ -1846,7 +2064,6 @@ class THCCachingAllocator {
         device,
         ": did you call init?");
     Block* block = device_allocator[device]->malloc(device, size, stream);
-    // <bojian/DynamicCUDAGraph>
     if (!device_allocator[device]->is_using_taped_malloc()) {
       add_allocated_block(block);
     }
@@ -1859,10 +2076,9 @@ class THCCachingAllocator {
     }
     Block* block = get_allocated_block(ptr, true /* remove */);
     if (!block) {
-      // <bojian/DynamicCUDAGraph> Since we do not cache the blocks in the case
-      //                           of using taped memory allocations, it is
-      //                           possible for the queried result to be NULL
-      //                           under these circumstances.
+      // <bojian/Grape> Since we do not cache the blocks in the case of using
+      // taped memory allocations, it is possible for the queried result to be
+      // NULL under these circumstances.
       //
       // TORCH_CHECK(false, "invalid device pointer: ", ptr);
       return;
@@ -1936,11 +2152,12 @@ class THCCachingAllocator {
     return result;
   }
 
-  // <bojian/DynamicCUDAGraph>
+  // <bojian/Grape>
   friend void notifyMempoolEnd(
       const int device,
       const MempoolId_t& mempool_id,
-      const int enter_cnt);
+      const int enter_cnt,
+      const bool force_retire_all_active_blocks);
 };
 
 THCCachingAllocator caching_allocator;
@@ -1958,6 +2175,116 @@ static void uncached_delete(void* ptr) {
   C10_CUDA_CHECK(cudaFree(ptr));
 }
 
+// <bojian/Grape>
+/// Whether the alias prediction is enabled or not
+static bool s_enable_alias_prediction = false;
+/// Whether the alias prediction should operate verbosely and dump runtime
+/// messages
+static bool s_verbose_alias_prediction = false;
+
+/// @brief A "deleter" that does not delete. This is used by the alias
+/// prediction since each preemptive allocation references a CUDAGraph
+/// placeholder and hence cannot be freed.
+/// @param dptr
+static void null_delete(void* dptr) {}
+
+struct AllocationContextHasher {
+  std::hash<void*> ptr_hasher;
+  std::hash<int> int_hasher;
+  std::hash<size_t> size_t_hasher;
+  std::hash<DeviceIndex> device_index_hasher;
+  size_t operator()(const AllocationContext& alloc_ctx) const {
+    size_t hash_val = ptr_hasher(alloc_ctx.f_code);
+    // https://stackoverflow.com/a/2595226/6320608
+#define ALLOC_CTX_HASH_COMBINE(hasher, member)                          \
+  hash_val ^= hasher(alloc_ctx.member) + 0x9e3779b9 + (hash_val << 6) + \
+      (hash_val >> 2)
+
+    ALLOC_CTX_HASH_COMBINE(int_hasher, f_lasti);
+    ALLOC_CTX_HASH_COMBINE(size_t_hasher, request_id);
+    ALLOC_CTX_HASH_COMBINE(device_index_hasher, device_id);
+#undef ALLOC_CTX_HASH_COMBINE
+    return hash_val;
+  }
+};
+
+struct AllocationContextComparator {
+  bool operator()(const AllocationContext& lhs, const AllocationContext& rhs)
+      const {
+    return lhs.f_code == rhs.f_code && lhs.f_lasti == rhs.f_lasti &&
+        lhs.request_id == rhs.request_id && lhs.device_id == rhs.device_id;
+  }
+};
+
+static std::unordered_map<
+    AllocationContext,
+    CUDAGraphPlaceholderId,
+    AllocationContextHasher,
+    AllocationContextComparator>
+    s_alloc_ctx_to_cuda_graph_ph;
+
+struct CUDAGraphPlaceholderMetadata {
+  void* dptr = nullptr;
+  size_t size = 0;
+  bool has_been_preemptively_allocated = false;
+  CUDAGraphPlaceholderMetadata() = default;
+  CUDAGraphPlaceholderMetadata(void* const dptr, const size_t size)
+      : dptr(dptr), size(size) {}
+};
+
+static std::unordered_map<
+    MempoolId_t,
+    std::vector<CUDAGraphPlaceholderMetadata>,
+    MempoolIdHash>
+    s_cuda_graph_placeholders;
+
+static PyCodeObject* s_last_py_code_obj = nullptr;
+static int s_last_py_frame_last_instr = 0;
+static size_t s_alloc_ctx_contig_cnt = 0;
+
+void checkPreemptiveAllocation(
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id) {
+  try {
+    CUDAGraphPlaceholderMetadata& cuda_graph_placeholder_metadata =
+        s_cuda_graph_placeholders.at(cuda_graph_placeholder_id.mempool_id)
+            .at(cuda_graph_placeholder_id.tensor_id);
+    CHECK(!cuda_graph_placeholder_metadata.has_been_preemptively_allocated);
+  } catch (std::out_of_range& err) {
+    LOG(FATAL) << cuda_graph_placeholder_id << " does not exist";
+  }
+}
+
+void clearPreemptiveAllocation(
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id) {
+  try {
+    CUDAGraphPlaceholderMetadata& cuda_graph_placeholder_metadata =
+        s_cuda_graph_placeholders.at(cuda_graph_placeholder_id.mempool_id)
+            .at(cuda_graph_placeholder_id.tensor_id);
+    cuda_graph_placeholder_metadata.has_been_preemptively_allocated = false;
+  } catch (std::out_of_range& err) {
+    LOG(FATAL) << cuda_graph_placeholder_id << " does not exist";
+  }
+}
+
+static size_t s_current_placeholder_idx = 0;
+static bool s_is_forwarding = false;
+static std::vector<size_t> s_dptrs_to_forward;
+
+void fwdToCUDAGraphPlaceholdersBegin(
+    const std::vector<size_t>& placeholder_dptrs) {
+  s_is_forwarding = true;
+  s_current_placeholder_idx = 0;
+  s_dptrs_to_forward = placeholder_dptrs;
+}
+
+C10_CUDA_API void fwdToCUDAGraphPlaceholdersEnd() {
+  s_is_forwarding = false;
+  CHECK(s_current_placeholder_idx == s_dptrs_to_forward.size() * 2)
+      << s_current_placeholder_idx << " != " << s_dptrs_to_forward.size();
+}
+
+// </bojian/Grape>
+
 // NB: I decided not to fold this into THCCachingAllocator, because the latter
 // has a lot more methods and it wasn't altogether clear that they should
 // actually be publicly exposed
@@ -1971,6 +2298,90 @@ struct CudaCachingAllocator : public Allocator {
     int device;
     C10_CUDA_CHECK(cudaGetDevice(&device));
     void* r = nullptr;
+
+    // <bojian/Grape>
+    /**
+     * Allocation Context
+     */
+    // Get the allocation context (i.e., the Python frame). Note that directly
+    // using the `PyThreadState_GET` API leads to runtime errors.
+    PyCodeObject* py_code_obj = nullptr;
+    int py_frame_last_instr = 0;
+    AllocationContext alloc_ctx(py_code_obj, py_frame_last_instr, 0, device);
+
+    if (s_is_forwarding) {
+      if ((s_current_placeholder_idx + 1) % 2 == 0) {
+        DataPtr ret(
+            reinterpret_cast<void*>(
+                s_dptrs_to_forward[(s_current_placeholder_idx - 1) / 2]),
+            reinterpret_cast<void*>(
+                s_dptrs_to_forward[(s_current_placeholder_idx - 1) / 2]),
+            &null_delete,
+            Device(DeviceType::CUDA, device),
+            alloc_ctx);
+        s_current_placeholder_idx += 1;
+        return ret;
+      }
+      s_current_placeholder_idx += 1;
+    }
+
+    if (s_enable_alias_prediction) {
+      /**
+       * Allocation Context -> CUDAGraph Placeholder (Alias Prediction)
+       */
+      std::pair<PyCodeObject*, int> current_py_frame = getCurrentPyFrame();
+      py_code_obj = current_py_frame.first;
+      py_frame_last_instr = current_py_frame.second;
+      // If the Python frame is the same as the previous one that issues a
+      // memory request, increment the contiguous counter by 1. Otherwise, reset
+      // it to 0.
+      if (py_code_obj == s_last_py_code_obj &&
+          py_frame_last_instr == s_last_py_frame_last_instr) {
+        s_alloc_ctx_contig_cnt += 1;
+      } else {
+        s_alloc_ctx_contig_cnt = 0;
+        s_last_py_code_obj = py_code_obj;
+        s_last_py_frame_last_instr = py_frame_last_instr;
+      }
+
+      alloc_ctx.f_code = current_py_frame.first;
+      alloc_ctx.f_lasti = current_py_frame.second;
+      alloc_ctx.request_id = s_alloc_ctx_contig_cnt;
+
+      auto alloc_ctx_to_cuda_graph_ph_iter =
+          s_alloc_ctx_to_cuda_graph_ph.find(alloc_ctx);
+      if (alloc_ctx_to_cuda_graph_ph_iter !=
+          s_alloc_ctx_to_cuda_graph_ph.end()) {
+        const CUDAGraphPlaceholderId& cuda_graph_placeholder_id =
+            alloc_ctx_to_cuda_graph_ph_iter->second;
+        if (s_verbose_alias_prediction) {
+          LOG(INFO) << "Preemptively allocating " << cuda_graph_placeholder_id
+                    << " @" << alloc_ctx;
+        }
+        try {
+          CUDAGraphPlaceholderMetadata& cuda_graph_placeholder_metadata =
+              s_cuda_graph_placeholders.at(cuda_graph_placeholder_id.mempool_id)
+                  .at(cuda_graph_placeholder_id.tensor_id);
+          CHECK(size <= cuda_graph_placeholder_metadata.size)
+              << "The requested size=" << size
+              << " > the CUDAGraph placeholder size="
+              << cuda_graph_placeholder_metadata.size;
+          cuda_graph_placeholder_metadata.has_been_preemptively_allocated =
+              true;
+          return DataPtr(
+              cuda_graph_placeholder_metadata.dptr,
+              cuda_graph_placeholder_metadata.dptr,
+              &null_delete,
+              Device(DeviceType::CUDA, device),
+              alloc_ctx);
+        } catch (std::out_of_range& err) {
+          LOG(FATAL) << cuda_graph_placeholder_id << " does not exist";
+        }
+      } // if (alloc_ctx_to_cuda_graph_ph_iter !=
+        //     s_alloc_ctx_to_cuda_graph_ph.end())
+    } // if (s_enable_alias_prediction)
+    // </bojian/Grape>
+
     if (forceUncachedAllocator()) {
       // Deliberately don't use cudaMallocMaybeCapturing here, to force an error
       // if someone tries to use forceUncachedAllocator while capturing.
@@ -1981,7 +2392,55 @@ struct CudaCachingAllocator : public Allocator {
       caching_allocator.malloc(
           &r, device, size, cuda::getCurrentCUDAStream(device));
     }
+
+    // <bojian/Grape>
+    if (s_enable_alias_prediction) {
+      /**
+       * CUDAGraph Placeholder
+       */
+      // Check whether the current allocation belongs to a CUDAGraph
+      // placeholder.
+      std::unique_ptr<DeviceCachingAllocator>& device_allocator =
+          caching_allocator.device_allocator[device];
+      const bool is_cuda_graph_placeholder =
+          device_allocator->isAllocatingCUDAGraphPlaceholders();
+      MempoolId_t mempool_id = std::make_pair(0ULL, 0ULL);
+      size_t tensor_id = 0;
+      if (is_cuda_graph_placeholder) {
+        mempool_id = device_allocator->getCurrentMempoolId();
+        auto& placeholders = s_cuda_graph_placeholders[mempool_id];
+        // Use the malloc ID instead of the placeholders ID so as to unify the
+        // placehoolders of different shapes.
+        //     tensor_id = placeholders.size();
+        tensor_id = device_allocator->getCurrentMallocID();
+
+        if (device_allocator->isTapingMalloc()) {
+          // Cannot directly push the object into the list since the unique
+          // pointer of `DataPtr` prohibits copy construction.
+          placeholders.emplace_back(r, size);
+        }
+      }
+      /**
+       * Return
+       */
+      DataPtr ret(
+          r,
+          r,
+          &raw_delete,
+          Device(DeviceType::CUDA, device),
+          alloc_ctx,
+          is_cuda_graph_placeholder,
+          CUDAGraphPlaceholderId(mempool_id, tensor_id));
+      // if (s_verbose_alias_prediction) {
+      //   LOG(INFO) << ret.alloc_ctx;
+      //   if (is_cuda_graph_placeholder) {
+      //     LOG(INFO) << "  " << ret.cuda_graph_placeholder_id;
+      //   }
+      // }
+      return ret;
+    } // if (s_enable_alias_prediction)
     return {r, r, &raw_delete, Device(DeviceType::CUDA, device)};
+    // </bojian/Grape>
   }
   DeleterFnPtr raw_deleter() const override {
     if (forceUncachedAllocator()) {
@@ -2075,7 +2534,19 @@ void notifyCaptureDestroy(int device, MempoolId_t mempool_id) {
   caching_allocator.device_allocator[device]->notifyCaptureDestroy(mempool_id);
 }
 
-// <bojian/DynamicCUDAGraph> The start and the end of CUDAGraph.
+// <bojian/Grape> C APIs
+
+void notifyPrivatePoolBegin(int device, const MempoolId_t& mempool_id) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyPrivatePoolBegin(
+      mempool_id);
+}
+
+void notifyPrivatePoolEnd(int device) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyPrivatePoolEnd();
+}
+
 void notifyMempoolBegin(
     const int device,
     const MempoolId_t& mempool_id,
@@ -2088,30 +2559,39 @@ void notifyMempoolBegin(
 void notifyMempoolEnd(
     const int device,
     const MempoolId_t& mempool_id,
-    const int enter_cnt) {
+    const int enter_cnt,
+    const bool force_retire_all_active_blocks) {
   assertValidDevice(device);
   caching_allocator.device_allocator[device]->notifyMempoolEnd(
-      mempool_id, enter_cnt);
+      mempool_id, enter_cnt, force_retire_all_active_blocks);
 
-  ska::flat_hash_map<void*, Block*>& allocated_blocks =
-      caching_allocator.allocated_blocks;
-  ska::flat_hash_set<Block*>& active_blocks_inside_memory_pool =
-      caching_allocator.device_allocator[device]
-          ->active_blocks_inside_memory_pool;
+  if (force_retire_all_active_blocks) {
+    ska::flat_hash_map<void*, Block*>& allocated_blocks =
+        caching_allocator.allocated_blocks;
+    ska::flat_hash_set<Block*>& active_blocks_inside_memory_pool =
+        caching_allocator.device_allocator[device]
+            ->active_blocks_inside_memory_pool;
 
-  for (Block* block : active_blocks_inside_memory_pool) {
-    void* ptr_to_remove = nullptr;
-    for (std::pair<void*, Block*>& ptr_block_pair : allocated_blocks) {
-      if (ptr_block_pair.second == block) {
-        ptr_to_remove = ptr_block_pair.first;
-        break;
+    for (Block* block : active_blocks_inside_memory_pool) {
+      void* ptr_to_remove = nullptr;
+      for (std::pair<void*, Block*>& ptr_block_pair : allocated_blocks) {
+        if (ptr_block_pair.second == block) {
+          ptr_to_remove = ptr_block_pair.first;
+          break;
+        }
+      }
+      if (ptr_to_remove != nullptr) {
+        allocated_blocks.erase(ptr_to_remove);
       }
     }
-    if (ptr_to_remove != nullptr) {
-      allocated_blocks.erase(ptr_to_remove);
-    }
+    active_blocks_inside_memory_pool.clear();
+  } // if (force_retire_all_active_blocks)
+}
+
+void retireOutputDataPtrs(const std::vector<size_t>& output_dptrs) {
+  for (const size_t dptr : output_dptrs) {
+    raw_delete(reinterpret_cast<void*>(dptr));
   }
-  active_blocks_inside_memory_pool.clear();
 }
 
 void notifyMemtapeBegin(
@@ -2131,6 +2611,84 @@ void notifyMemtapeEnd(
   caching_allocator.device_allocator[device]->notifyMemtapeEnd(
       mempool_id, enter_cnt);
 }
+
+size_t getCurrentMemtapePos(const int device, const MempoolId_t& mempool_id) {
+  assertValidDevice(device);
+  return caching_allocator.device_allocator[device]
+      ->taped_alloc_params_with_block_copy.at(mempool_id)
+      .size();
+}
+
+size_t getCurrentMemtapeInReplayPos(const int device) {
+  assertValidDevice(device);
+  return caching_allocator.device_allocator[device]->num_of_mallocs_requested;
+}
+
+void setCurrentMemtapePos(
+    const int device,
+    const size_t num_of_mallocs_requested) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->num_of_mallocs_requested =
+      num_of_mallocs_requested;
+}
+
+void lookupDataPtrInMemtape(
+    const int device,
+    const MempoolId_t& mempool_id,
+    const size_t data_ptr) {
+  assertValidDevice(device);
+  std::vector<std::pair<AllocParams, Block>>& taped_alloc_params_with_block =
+      caching_allocator.device_allocator[device]
+          ->taped_alloc_params_with_block_copy.at(mempool_id);
+  LOG(INFO) << "Looking up data_ptr=" << reinterpret_cast<void*>(data_ptr)
+            << " at mempool_id=" << mempool_id;
+  size_t tape_idx = 0;
+  for (std::pair<AllocParams, Block>& kv : taped_alloc_params_with_block) {
+    if (kv.second.ptr == reinterpret_cast<void*>(data_ptr)) {
+      LOG(INFO) << "tape_idx=" << tape_idx;
+    }
+    tape_idx += 1;
+  }
+}
+
+void notifyCUDAGraphPlaceholdersBegin(const int device) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]
+      ->notifyCUDAGraphPlaceholdersBegin();
+}
+
+void notifyCUDAGraphPlaceholdersEnd(const int device) {
+  assertValidDevice(device);
+  caching_allocator.device_allocator[device]->notifyCUDAGraphPlaceholdersEnd();
+}
+
+void enableAliasPredictionWithVerbosity(const bool verbose) {
+  LOG(INFO) << "Enabling alias prediction globally";
+  s_enable_alias_prediction = true;
+  s_verbose_alias_prediction = verbose;
+}
+
+void disableAliasPrediction() {
+  LOG(INFO) << "Disabling alias prediction globally";
+  s_enable_alias_prediction = false;
+}
+
+void resetAllocationContextContigCnt() {
+  s_alloc_ctx_contig_cnt = 0;
+}
+
+void linkAllocationCtxToCUDAGraphPlaceholder(
+    const AllocationContext& alloc_ctx,
+    const CUDAGraphPlaceholderId& cuda_graph_placeholder_id) {
+  if (alloc_ctx.f_code == nullptr) {
+    return;
+  }
+  if (s_verbose_alias_prediction) {
+    LOG(INFO) << "Linking " << alloc_ctx << " to " << cuda_graph_placeholder_id;
+  }
+  s_alloc_ctx_to_cuda_graph_ph[alloc_ctx] = cuda_graph_placeholder_id;
+}
+// </bojian/Grape>
 
 //
 // In CUDA IPC, sender sends a tensor to receiver, getIpcDevPtr

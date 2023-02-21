@@ -1,3 +1,4 @@
+// clang-format off
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/Context.h>
@@ -17,11 +18,10 @@
 #include <ATen/ops/empty_like.h>
 #endif
 
-
-// <bojian/DynamicCUDAGraph>
+// <bojian/Grape>
+#include <ATen/cuda/CUDAGlobalIndicator.cuh>
 #include <dmlc/parameter.h>
 #include <dmlc/logging.h>
-#include <ATen/cuda/CUDAGlobalExecMask.cuh>
 
 
 namespace at {
@@ -54,10 +54,9 @@ void neg_conj_kernel_cuda(TensorIteratorBase &iter) {
 
 using namespace at::cuda;
 
-
-
-// <bojian/DynamicCUDAGraph>
-__device__ __forceinline__ int64_t cumsumStorageOffset(const DeviceStorageOffsets& device_storage_offsets) {
+// <bojian/Grape>
+__device__ __forceinline__ int64_t
+cumsumStorageOffset(const DeviceStorageOffsets& device_storage_offsets) {
   int64_t ret = 0;
 
 #pragma unroll
@@ -70,20 +69,19 @@ __device__ __forceinline__ int64_t cumsumStorageOffset(const DeviceStorageOffset
           device_storage_offsets.offsets[i].dim_size;
     }
     ret += device_storage_offsets.offsets[i].device_index_ptr[0] *
-           device_storage_offsets.offsets[i].dim_stride;
+        device_storage_offsets.offsets[i].dim_stride;
   }
   return ret;
 }
 
 template <typename DataType>
 __global__ void cudaMemcpyKernel(
-    DataType *const __restrict__ dst,
-    DataType *const __restrict__ src,
-    const size_t numel
-    CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS) {
+    DataType* const __restrict__ dst,
+    DataType* const __restrict__ src,
+    const size_t numel GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
   const size_t g_threadIdx = threadIdx.x + blockIdx.x * blockDim.x;
 
-  UPDATE_GLOBAL_EXEC_MASK {
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
     if (g_threadIdx < numel) {
       dst[g_threadIdx] = src[g_threadIdx];
     }
@@ -92,37 +90,41 @@ __global__ void cudaMemcpyKernel(
 
 template <typename DataType>
 __global__ void cudaMemcpyKernelWithDeviceStorageOffset(
-    DataType *const __restrict__ dst,
-    DataType *const __restrict__ src,
+    DataType* const __restrict__ dst,
+    DataType* const __restrict__ src,
     const size_t numel,
     const size_t item_stride,
     const DeviceStorageOffsets dst_device_storage_offsets,
     const DeviceStorageOffsets src_device_storage_offsets
-    CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS) {
+        GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
   const size_t g_threadIdx = threadIdx.x + blockIdx.x * blockDim.x;
 
-  UPDATE_GLOBAL_EXEC_MASK {
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
     if (g_threadIdx < numel) {
-      int64_t dst_storage_offset = cumsumStorageOffset(dst_device_storage_offsets),
-              src_storage_offset = cumsumStorageOffset(src_device_storage_offsets);
-      dst[dst_storage_offset * item_stride + g_threadIdx] = src[src_storage_offset * item_stride + g_threadIdx];
+      int64_t dst_storage_offset =
+                  cumsumStorageOffset(dst_device_storage_offsets),
+              src_storage_offset =
+                  cumsumStorageOffset(src_device_storage_offsets);
+      dst[dst_storage_offset * item_stride + g_threadIdx] =
+          src[src_storage_offset * item_stride + g_threadIdx];
     }
   }
 }
 
 template <typename DataType>
 __global__ void cudaMemcpyKernelWithSrcDeviceStorageOffset(
-    DataType *const __restrict__ dst,
-    DataType *const __restrict__ src,
+    DataType* const __restrict__ dst,
+    DataType* const __restrict__ src,
     const size_t numel,
     const size_t item_stride,
     const DeviceStorageOffsets src_device_storage_offsets
-    CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS) {
+        GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
   const size_t g_threadIdx = threadIdx.x + blockIdx.x * blockDim.x;
 
-  UPDATE_GLOBAL_EXEC_MASK {
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
     if (g_threadIdx < numel) {
-      int64_t src_storage_offset = cumsumStorageOffset(src_device_storage_offsets);
+      int64_t src_storage_offset =
+          cumsumStorageOffset(src_device_storage_offsets);
       dst[g_threadIdx] = src[src_storage_offset * item_stride + g_threadIdx];
     }
   }
@@ -130,23 +132,22 @@ __global__ void cudaMemcpyKernelWithSrcDeviceStorageOffset(
 
 template <typename DataType>
 __global__ void cudaMemcpyKernelWithDstDeviceStorageOffset(
-    DataType *const __restrict__ dst,
-    DataType *const __restrict__ src,
+    DataType* const __restrict__ dst,
+    DataType* const __restrict__ src,
     const size_t numel,
     const size_t item_stride,
     const DeviceStorageOffsets dst_device_storage_offsets
-    CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_ARGS) {
+        GRAPE_GLOBAL_INDICATOR_KERNEL_ARGS) {
   const size_t g_threadIdx = threadIdx.x + blockIdx.x * blockDim.x;
 
-  UPDATE_GLOBAL_EXEC_MASK {
+  GRAPE_UPDATE_GLOBAL_INDICATOR {
     if (g_threadIdx < numel) {
-      int64_t dst_storage_offset = cumsumStorageOffset(dst_device_storage_offsets);
+      int64_t dst_storage_offset =
+          cumsumStorageOffset(dst_device_storage_offsets);
       dst[dst_storage_offset * item_stride + g_threadIdx] = src[g_threadIdx];
     }
   }
 }
-
-
 
 // device-to-device copy, does type conversion
 void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
@@ -192,15 +193,11 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
     if (src != dst || src_device != dst_device) {
       // Perform the copy
 
-
-      // <bojian/DynamicCUDAGraph>
-      if (dmlc::GetEnv("CUDA_GRAPH_REWRITE_FOR_COMPAT", false)) {
-        // CHECK(size % sizeof(int32_t) == 0 &&
-        //       iter.tensor(0).element_size() % sizeof(int32_t) == 0);
-        // LOG(INFO) << "Invoking customized copy kernel with numel="
-        //           << (size / sizeof(int32_t)) << ", item_stride="
-        //           << iter.element_size(0) / sizeof(int32_t);
-
+      // <bojian/Grape> Switch to customized device copy kernels that
+      // clang-format on
+      // - Support storage offsets on the device end.
+      // - Can be invoked conditionally under the CUDAGraph environment.
+      if (dmlc::GetEnv("GRAPE_REWRITE_FOR_CUDA_GRAPH_COMPAT", false)) {
         // Handle for common cases when the element size is a multiple of 4
         // bytes.
         if (iter.element_size(0) % sizeof(int32_t) == 0) {
@@ -210,8 +207,9 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
                   <<<(size / sizeof(int32_t) + 31) / 32, 32, 0, copy_stream>>>(
                       static_cast<int32_t*>(dst),
                       static_cast<int32_t*>(src),
-                      size / sizeof(int32_t)
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                      size /
+                          sizeof(int32_t)
+                              GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             } else {
               cudaMemcpyKernelWithSrcDeviceStorageOffset<int32_t>
                   <<<(size / sizeof(int32_t) + 31) / 32, 32, 0, copy_stream>>>(
@@ -220,7 +218,7 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
                       size / sizeof(int32_t),
                       iter.element_size(0) / sizeof(int32_t),
                       iter.tensor(1).device_storage_offsets()
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                          GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             }
           } else {
             if (iter.tensor(1).device_storage_offsets().num_offsets == 0) {
@@ -231,7 +229,7 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
                       size / sizeof(int32_t),
                       iter.element_size(0) / sizeof(int32_t),
                       iter.tensor(0).device_storage_offsets()
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                          GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             } else {
               cudaMemcpyKernelWithDeviceStorageOffset<int32_t>
                   <<<(size / sizeof(int32_t) + 31) / 32, 32, 0, copy_stream>>>(
@@ -241,26 +239,29 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
                       iter.element_size(0) / sizeof(int32_t),
                       iter.tensor(0).device_storage_offsets(),
                       iter.tensor(1).device_storage_offsets()
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                          GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             }
           }
         } else {
+          // LOG(WARNING)
+          //     << "Doing byte-by-byte copying since tensor element size="
+          //     << iter.element_size(0) << " is not divisible by sizeof(int32_t)";
+
           if (iter.tensor(0).device_storage_offsets().num_offsets == 0) {
             if (iter.tensor(1).device_storage_offsets().num_offsets == 0) {
               cudaMemcpyKernel<char><<<(size + 31) / 32, 32, 0, copy_stream>>>(
                   static_cast<char*>(dst),
                   static_cast<char*>(src),
-                  size
-                  CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                  size GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             } else {
               cudaMemcpyKernelWithSrcDeviceStorageOffset<char>
                   <<<(size + 31) / 32, 32, 0, copy_stream>>>(
                       static_cast<char*>(dst),
                       static_cast<char*>(src),
                       size,
-                      iter.element_size(0) / sizeof(int32_t),
+                      iter.element_size(0),
                       iter.tensor(1).device_storage_offsets()
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                          GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             }
           } else {
             if (iter.tensor(1).device_storage_offsets().num_offsets == 0) {
@@ -269,9 +270,9 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
                       static_cast<char*>(dst),
                       static_cast<char*>(src),
                       size,
-                      iter.element_size(0) / sizeof(int32_t),
+                      iter.element_size(0),
                       iter.tensor(0).device_storage_offsets()
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                          GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             } else {
               cudaMemcpyKernelWithDeviceStorageOffset<char>
                   <<<(size + 31) / 32, 32, 0, copy_stream>>>(
@@ -281,19 +282,16 @@ void copy_device_to_device(TensorIterator& iter, bool non_blocking) {
                       iter.element_size(0),
                       iter.tensor(0).device_storage_offsets(),
                       iter.tensor(1).device_storage_offsets()
-                      CUDA_GRAPH_GLOBAL_EXEC_MASK_KERNEL_LAUNCH_ARGS);
+                          GRAPE_GLOBAL_INDICATOR_KERNEL_LAUNCH_ARGS);
             }
           }
         }
-
       } else {
         AT_CUDA_CHECK(cudaMemcpyAsync(
-            dst, src, size,
-            cudaMemcpyDeviceToDevice,
-            copy_stream));
-      }
-
-
+            dst, src, size, cudaMemcpyDeviceToDevice, copy_stream));
+      } // if (dmlc::GetEnv("GRAPE_REWRITE_FOR_CUDA_GRAPH_COMPAT", false))
+      // clang-format off
+      // </<bojian/Grape>
     }
   } else {
     if (same_neg) {
@@ -454,10 +452,10 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
   }
 
   if (iter.tensor(0).is_conj() != iter.tensor(1).is_conj()) {
-     iter.tensor(0).conj_physical_();
+    iter.tensor(0).conj_physical_();
   }
   if (iter.tensor(0).is_neg() != iter.tensor(1).is_neg()) {
-     iter.tensor(0).neg_();
+    iter.tensor(0).neg_();
   }
 }
 

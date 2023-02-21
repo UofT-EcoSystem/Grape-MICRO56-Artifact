@@ -1,12 +1,11 @@
+# fmt: off
 import gc
 import itertools
 import os
+import threading # <bojian/Grape>
 import torch
 
-from tqdm import tqdm
-
 from ._utils import _dummy_type
-
 
 if not hasattr(torch._C, '_CudaStreamBase'):
     # Define dummy base classes
@@ -17,8 +16,14 @@ if not hasattr(torch._C, '_CudaStreamBase'):
 from torch._C import _CUDAGraph  # noqa: F401
 from torch._C import _graph_pool_handle
 from torch._C import _cuda_isCurrentStreamCapturing
-from torch._C import _notifyMempoolBegin, _notifyMempoolEnd
-from torch._C import _notifyMemtapeBegin, _notifyMemtapeEnd
+
+import logging
+
+from quik_fix import nvml  # <bojian/Grape>
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+CONFIG_REPORT_GPU_MEMORY_USAGE = False
 
 
 def is_current_stream_capturing():
@@ -41,40 +46,6 @@ def graph_pool_handle():
     return _graph_pool_handle()
 
 
-# <bojian/DynamicCUDAGraph>
-class MemoryPoolBase:
-
-    current_mempool_id = None
-
-    def __init__(self, mempool_id, fenter, fexit):
-        self.device = torch.cuda.current_device()
-        self.mempool_id = mempool_id
-        self.outer_scope_mempool_id = None
-        self.fenter = fenter
-        self.fexit = fexit
-        self.enter_cnt = 0
-
-    def __enter__(self):
-        self.outer_scope_mempool_id = MemoryPool.current_mempool_id
-        MemoryPool.current_mempool_id = self.mempool_id
-        self.fenter(self.device, self.mempool_id, self.enter_cnt)
-
-    def __exit__(self, *exec_info):
-        self.fexit(self.device, self.mempool_id, self.enter_cnt)
-        MemoryPool.current_mempool_id = self.outer_scope_mempool_id
-        self.enter_cnt += 1
-
-
-class MemoryPool(MemoryPoolBase):
-    def __init__(self, mempool_id):
-        super().__init__(mempool_id, _notifyMempoolBegin, _notifyMempoolEnd)
-
-
-class MemoryTape(MemoryPoolBase):
-    def __init__(self, mempool_id):
-        super().__init__(mempool_id, _notifyMemtapeBegin, _notifyMemtapeEnd)
-
-
 # Python shim helps Sphinx process docstrings more reliably.
 class CUDAGraph(torch._C._CUDAGraph):
     r"""
@@ -84,29 +55,30 @@ class CUDAGraph(torch._C._CUDAGraph):
         This API is in beta and may change in future releases.
     """
     def __new__(cls, 
-                
-                # <bojian/DynamicCUDAGraph>
-                compress_metadata
-                
-                ):
-        return super(CUDAGraph, cls).__new__(cls, 
-            
-            # <bojian/DynamicCUDAGraph>
-            compress_metadata
-
+                # <bojian/Grape> Add extra arguments that add the ability of
+                # postponing the instantiation when the capture ends and
+                # removing necessary calls in the graph invocation.
+                postpone_instantiation=False,
+                frugal_launch=True,
+                instantiate_on_device=False):
+        return super(CUDAGraph, cls).__new__(
+            cls, 
+            # <bojian/Grape>
+            postpone_instantiation,
+            frugal_launch,
+            instantiate_on_device,
         )
 
     def __init__(self, 
-
-                 # <bojian/DynamicCUDAGraph>
-                 compress_metadata=False
-
-                 ):
+                 # <bojian/Grape>
+                 postpone_instantiation=False,
+                 frugal_launch=True,
+                 instantiate_on_device=False):
         super(CUDAGraph, self).__init__(
-
-            # <bojian/DynamicCUDAGraph>
-            compress_metadata
-
+            # <bojian/Grape>
+            postpone_instantiation,
+            frugal_launch,
+            instantiate_on_device
         )
 
     def capture_begin(self, pool=None):
@@ -129,7 +101,11 @@ class CUDAGraph(torch._C._CUDAGraph):
         else:
             super(CUDAGraph, self).capture_begin(pool)
 
-    def capture_end(self):
+    def capture_end(
+        self,
+        # <bojian/Grape> Only instantiate if there is no exception during the capture.
+        no_exception_in_capture
+    ):
         r"""
         Ends CUDA graph capture on the current stream.
         After ``capture_end``, ``replay`` may be called on this instance.
@@ -138,7 +114,9 @@ class CUDAGraph(torch._C._CUDAGraph):
         Use :class:`~torch.cuda.graph` or :func:`~torch.cuda.make_graphed_callables`,
         which call ``capture_end`` internally.
         """
-        super(CUDAGraph, self).capture_end()
+        super(CUDAGraph, self).capture_end(
+            no_exception_in_capture # <bojian/Grape>
+        )
 
     def replay(self):
         r"""
@@ -147,10 +125,9 @@ class CUDAGraph(torch._C._CUDAGraph):
         super(CUDAGraph, self).replay()
 
 
-    # <bojian/DynamicCUDAGraph>
+    # <bojian/Grape>
     def decompress(self):
         super(CUDAGraph, self).decompress()
-
 
     def reset(self):
         r"""
@@ -167,13 +144,8 @@ class CUDAGraph(torch._C._CUDAGraph):
         return super(CUDAGraph, self).pool()
 
 
-# <bojian/DynamicCUDAGraph>
-class CUDAGraphRewriteCtx:
-    def __enter__(self):
-        os.environ["CUDA_GRAPH_REWRITE_FOR_COMPAT"] = "1"
-
-    def __exit__(self, *args):
-        os.environ["CUDA_GRAPH_REWRITE_FOR_COMPAT"] = "0"
+this_thread = threading.local()
+this_thread.current_graph_scope = None
 
 
 class graph(object):
@@ -205,10 +177,9 @@ class graph(object):
                  cuda_graph,
                  pool=None,
                  stream=None,
-                 
-                 # <bojian/DynamicCUDAGraph>
-                 rewrite_for_compat=False
-                 
+                 # <bojian/Grape>
+                 # rewrite_for_compat=False
+                 enter_silently=False
                  ):
         # Lazy-init of default_capture_stream helps avoid circular-import errors.
         # Not thread safe, but graphs already have the general (explicitly documented)
@@ -216,26 +187,18 @@ class graph(object):
         if self.__class__.default_capture_stream is None:
             self.__class__.default_capture_stream = torch.cuda.Stream()
 
-
-        # <bojian/DynamicCUDAGraph> No longer need to overwrite the memory pool
-        #                           ID since this is now done implicitly at the
-        #                           C++ level.
-        # if MemoryPoolBase.current_mempool_id is not None:
-        #     pool = MemoryPoolBase.current_mempool_id
-
-
         self.pool = () if pool is None else (pool,)
         self.capture_stream = stream if stream is not None else self.__class__.default_capture_stream
         assert self.capture_stream is not None
         self.stream_ctx = torch.cuda.stream(self.capture_stream)
         self.cuda_graph = cuda_graph
 
-        # <bojian/DynamicCUDAGraph>
-        self.rewrite_for_compat = rewrite_for_compat
-        if rewrite_for_compat:
-            print("Transforming the underlying programs for CUDAGraph compatibility")
-            self.cuda_graph_rewrite_ctx = CUDAGraphRewriteCtx()
-
+        # <bojian/Grape> No longer need to overwrite the memory pool ID since
+        # # this is now done implicitly at the C++ level.
+        # from torch.cuda.graphs_ext import GrapeRewriterCtx # pylint: disable=import-outside-toplevel
+        # self.rewriter_ctx = GrapeRewriterCtx() if rewrite_for_compat else nullcontext()
+        self.enter_silently = enter_silently
+        # </bojian/Grape>
 
     def __enter__(self):
         # Free as much memory as we can for the graph
@@ -247,26 +210,49 @@ class graph(object):
         # https://stackoverflow.com/questions/26635684/calling-enter-and-exit-manually#39172487
         self.stream_ctx.__enter__()
 
-
-        # <bojian/DynamicCUDAGraph>
-        if self.rewrite_for_compat:
-            self.cuda_graph_rewrite_ctx.__enter__()
-
+        # <bojian/Grape>
+        # self.rewriter_ctx.__enter__()
 
         self.cuda_graph.capture_begin(*self.pool)
 
+        # <bojian/Grape>
+        if not self.enter_silently:
+            assert this_thread.current_graph_scope is None, "Nested graph capture is not supported"
+            this_thread.current_graph_scope = self
+        # </bojian/Grape>
+
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.cuda_graph.capture_end()
+        # <bojian/Grape>
+        # from torch.cuda.graphs_ext import ( # pylint: disable=import-outside-toplevel
+        #     GRAPE_CWORKSPACE,
+        #     GrapeForceNonInlineDirectExit
+        # )
+        # if exc_type == GrapeForceNonInlineDirectExit:
+        #     return
 
-
-        # <bojian/DynamicCUDAGraph>
-        if self.rewrite_for_compat:
-            self.cuda_graph_rewrite_ctx.__exit__(None, None, None)
-
+        # self.cuda_graph.capture_end()
+        if CONFIG_REPORT_GPU_MEMORY_USAGE:
+            gpu_memory_before_instantiation = nvml.query_gpu_status(nvml.GPUQueryKind.MEMORY)
+        self.cuda_graph.capture_end(
+            exc_type is None # Only instantiate if there is no exception during the capture.
+        )
+        if CONFIG_REPORT_GPU_MEMORY_USAGE:
+            gpu_memory_usage = (
+                nvml.query_gpu_status(nvml.GPUQueryKind.MEMORY)[0][2] - gpu_memory_before_instantiation[0][2]
+            )
+            logger.info(f"GPU memory consumption: {gpu_memory_usage}")
+        # self.rewriter_ctx.__exit__(exc_type, exc_value, traceback)
+        # </bojian/Grape>
 
         self.stream_ctx.__exit__(exc_type, exc_value, traceback)
         # returning None should propagate exceptions from either capture_end or stream_ctx.__exit__()
+        
+        # <bojian/Grape>
+        if not self.enter_silently:
+            this_thread.current_graph_scope = None
+        # GRAPE_CWORKSPACE.clear()
+        # </bojian/Grape>
 
 
 def make_graphed_callables(callables, sample_args):

@@ -374,7 +374,6 @@ def can_device_access_peer(device: _device_t, peer_device: _device_t) -> bool:
         raise AssertionError("Invalid peer device id")
     return torch._C._cuda_canDeviceAccessPeer(device, peer_device)
 
-
 class StreamContext(object):
     r"""Context-manager that selects a given stream.
 
@@ -437,20 +436,6 @@ def stream(stream: Optional['torch.cuda.Stream']) -> StreamContext:
     an object of the custom class ``torch.classes.cuda.Stream``.
     """
     return StreamContext(stream)
-
-
-
-# <bojian/DynamicCUDAGraph>
-# class ModuleArgsGeneratorStreamContext(StreamContext):
-#     def __enter__(self):
-#         torch._C.EnterModuleArgsGeneratorStreamContext(self.stream)
-#         super().__enter__()
-
-#     def __exit__(self, *args):
-#         super().__exit__(*args)
-#         torch._C.ExitModuleArgsGeneratorStreamContext()
-
-
 
 def set_stream(stream: Stream):
     r"""Sets the current stream.This is a wrapper API to set the stream.
@@ -766,5 +751,5 @@ from . import profiler
 from . import nvtx
 from . import amp
 from . import jiterator
-# <bojian/DynamicCUDAGraph>
+# <bojian/Grape>
 from . import graphs_ext
