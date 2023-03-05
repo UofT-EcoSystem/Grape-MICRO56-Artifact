@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -2421,6 +2422,107 @@ done:
 
     return bIoCoherent;
 }
+
+
+// <bojian/Grape>
+// clang-format on
+
+NV_STATUS NV_API_CALL rm_query_recorded_pma_alloc_size_init(void)
+{
+	NV_STATUS rmStatus;
+	THREAD_STATE_NODE threadState;
+	// void *fp;
+
+	// NV_ENTER_RM_RUNTIME(sp, fp);
+	// The thread state init is mimicking the behavior of `rm_ioctl` API
+	// call.
+	threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+	rmStatus = RmQueryRecordedPMAAllocSize_init();
+
+	threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+	// NV_EXIT_RM_RUNTIME(sp, fp);
+	return rmStatus;
+}
+
+NV_STATUS NV_API_CALL rm_query_recorded_pma_alloc_size(NvU64 *pma_alloc_size)
+{
+	NV_STATUS rmStatus;
+	THREAD_STATE_NODE threadState;
+	// void *fp;
+
+	// NV_ENTER_RM_RUNTIME(sp, fp);
+	// The thread state init is mimicking the behavior of `rm_ioctl` API
+	// call.
+	threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+	rmStatus = RmQueryRecordedPMAAllocSize(pma_alloc_size);
+
+	threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+	// NV_EXIT_RM_RUNTIME(sp, fp);
+	return rmStatus;
+}
+
+NV_STATUS NV_API_CALL rm_query_num_recorded_residuals(NvU32 *residual_capacity,
+						      NvU32 *residual_idx)
+{
+	NV_STATUS rmStatus;
+	THREAD_STATE_NODE threadState;
+	// void *fp;
+
+	// NV_ENTER_RM_RUNTIME(sp, fp);
+	// The thread state init is mimicking the behavior of `rm_ioctl` API
+	// call.
+	threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+	rmStatus = RmQueryNumRecordedResiduals(residual_capacity, residual_idx);
+
+	threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+	// NV_EXIT_RM_RUNTIME(sp, fp);
+	return rmStatus;
+}
+
+NV_STATUS NV_API_CALL
+rm_query_capture_pma_alloc_mode(NvU32 *capture_pma_alloc_mode)
+{
+	NV_STATUS rmStatus;
+	THREAD_STATE_NODE threadState;
+	// void *fp;
+
+	// NV_ENTER_RM_RUNTIME(sp, fp);
+	// The thread state init is mimicking the behavior of `rm_ioctl` API
+	// call.
+	threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+	rmStatus = RmQueryCapturePMAAllocMode(capture_pma_alloc_mode);
+
+	threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+	// NV_EXIT_RM_RUNTIME(sp, fp);
+	return rmStatus;
+}
+
+NV_STATUS NV_API_CALL rm_capture_pma_alloc(
+	// nvidia_stack_t  *sp,
+	NvU32 capture_pma_alloc_mode)
+{
+	NV_STATUS rmStatus;
+	THREAD_STATE_NODE threadState;
+	// void *fp;
+
+	// NV_ENTER_RM_RUNTIME(sp, fp);
+	// The thread state init is mimicking the behavior of `rm_ioctl` API
+	// call.
+	threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+	rmStatus = RmCapturePMAAlloc(capture_pma_alloc_mode);
+
+	threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+	// NV_EXIT_RM_RUNTIME(sp, fp);
+	return rmStatus;
+}
+
+// clang-format off
+// </bojian/Grape>
 
 NV_STATUS NV_API_CALL rm_ioctl(
     nvidia_stack_t     *sp,

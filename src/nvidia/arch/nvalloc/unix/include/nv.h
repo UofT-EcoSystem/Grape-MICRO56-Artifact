@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -893,6 +894,43 @@ NV_STATUS  NV_API_CALL  rm_acquire_gpu_lock      (nvidia_stack_t *, nv_state_t *
 NV_STATUS  NV_API_CALL  rm_release_gpu_lock      (nvidia_stack_t *, nv_state_t *);
 NV_STATUS  NV_API_CALL  rm_acquire_all_gpus_lock (nvidia_stack_t *);
 NV_STATUS  NV_API_CALL  rm_release_all_gpus_lock (nvidia_stack_t *);
+
+// <bojian/Grape>
+// clang-format on
+
+/// @brief Query the recorded allocation sizes from PMA (used for initializing
+/// the iterator).
+/// @return
+NV_STATUS NV_API_CALL rm_query_recorded_pma_alloc_size_init(void);
+
+/// @brief Query the recorded allocation sizes from PMA.
+/// @param pma_alloc_size The last allocation size as is recorded by PMA
+/// @return
+NV_STATUS NV_API_CALL rm_query_recorded_pma_alloc_size(NvU64 *pma_alloc_size);
+
+/// @brief Query the number of recorded residuals.
+/// @param residual_capacity
+/// @param residual_idx
+/// @return
+NV_STATUS NV_API_CALL rm_query_num_recorded_residuals(NvU32 *residual_capacity,
+						      NvU32 *residual_idx);
+
+/// @brief Query the current mode of the PMAAllocCapturer.
+/// @param capture_pma_alloc_mode The current mode of the PMAAllocCapturer
+/// @return
+NV_STATUS NV_API_CALL
+rm_query_capture_pma_alloc_mode(NvU32 *capture_pma_alloc_mode);
+
+/// @brief Set the mode of the capturer that records the allocation behaviors of
+/// the PMA.
+/// @param mode
+/// @return
+/// @sa src/nvidia/arch/nvalloc/unix/src/escape.c
+NV_STATUS NV_API_CALL rm_capture_pma_alloc(NvU32 mode);
+
+// clang-format off
+// </bojian/Grape>
+
 NV_STATUS  NV_API_CALL  rm_ioctl                 (nvidia_stack_t *, nv_state_t *, nv_file_private_t *, NvU32, void *, NvU32);
 NvBool     NV_API_CALL  rm_isr                   (nvidia_stack_t *, nv_state_t *, NvU32 *);
 void       NV_API_CALL  rm_isr_bh                (nvidia_stack_t *, nv_state_t *);

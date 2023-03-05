@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -119,6 +120,41 @@ NV_STATUS  RmExcludeAdapter       (nv_state_t *);
 NvBool     RmGpuHasIOSpaceEnabled (nv_state_t *);
 
 void       RmFreeUnusedClients    (nv_state_t *, nv_file_private_t *);
+
+// <bojian/Grape>
+// clang-format on
+
+/// @brief Query the recorded allocation sizes from PMA (used for initializing
+/// the iterator).
+/// @return
+NV_STATUS RmQueryRecordedPMAAllocSize_init(void);
+
+/// @brief Query the recorded allocation sizes from PMA.
+/// @param pma_alloc_size The last allocation size as is recorded by PMA
+/// @return
+NV_STATUS RmQueryRecordedPMAAllocSize(NvU64 *pma_alloc_size);
+
+/// @brief Query the number of recorded residuals.
+/// @param num_recorded_residuals
+/// @return
+NV_STATUS RmQueryNumRecordedResiduals(NvU32 *residual_capacity,
+				      NvU32 *residual_idx);
+
+/// @brief Query the current mode of the PMAAllocCapturer.
+/// @param capture_pma_alloc_mode
+/// @return
+NV_STATUS RmQueryCapturePMAAllocMode(NvU32 *capture_pma_alloc_mode);
+
+/// @brief Set the mode of the capturer that records the allocation behaviors of
+/// the PMA.
+/// @param mode
+/// @return
+/// @sa src/nvidia/arch/nvalloc/unix/src/escape.c
+NV_STATUS RmCapturePMAAlloc(NvU32 capture_pma_alloc_mode);
+
+// clang-format off
+// </bojian/Grape>
+
 NV_STATUS  RmIoctl                (nv_state_t *, nv_file_private_t *, NvU32, void *, NvU32);
 
 NV_STATUS  RmAllocOsEvent         (NvHandle, nv_file_private_t *, NvU32);

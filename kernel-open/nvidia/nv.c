@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -833,7 +834,13 @@ int __init nvidia_init_module(void)
 
     nv_report_applied_patches();
 
-    nv_printf(NV_DBG_ERRORS, "NVRM: loading %s\n", pNVRM_ID);
+    // <bojian/Grape>
+	// nv_printf(NV_DBG_ERRORS, "NVRM: loading %s\n", pNVRM_ID);
+	// clang-format on
+	nv_printf(NV_DBG_ERRORS,
+		  "NVRM: loading customized kernel module from Grape\n");
+	// clang-format off
+    // </bojian/Grape>
 
 #if defined(NV_UVM_ENABLE)
     rc = nv_uvm_init();

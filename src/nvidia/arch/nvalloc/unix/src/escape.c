@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -282,6 +283,251 @@ ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, hObjectNew) == NV_OFFSETOF(NVOS64_PARAM
 ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, hClass) == NV_OFFSETOF(NVOS64_PARAMETERS, hClass));
 ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, pAllocParms) == NV_OFFSETOF(NVOS64_PARAMETERS, pAllocParms));
 
+// <bojian/Grape>
+// clang-format on
+
+#include "NVCapturePMAAllocMode.h"
+
+static NVCapturePMAAllocMode_t sCapturePMAAllocMode = kDefault;
+
+typedef struct {
+	NVOS32_PARAMETERS alloc_data;
+	NvU32 shadow_hmemory;
+} VidHeapCtrlDataWithShadowMemoryHandle;
+
+MAKE_LIST(CachedVidHeapControlDataList, VidHeapCtrlDataWithShadowMemoryHandle);
+MAKE_LIST(CachedVidHeapControlDataResidualList,
+	  VidHeapCtrlDataWithShadowMemoryHandle);
+
+static CachedVidHeapControlDataList sCachedVidHeapControlDataList;
+static CachedVidHeapControlDataListIter
+	sCachedVidHeapControlDataList_it = {},
+	sCachedVidHeapControlDataList_query_it = {};
+static int sCachedVidHeapControlDataListInitialized = 0;
+
+static CachedVidHeapControlDataResidualList
+	sCachedVidHeapControlDataResidualList;
+static CachedVidHeapControlDataResidualListIter
+	sCachedVidHeapControlDataResidualList_it = {};
+static int sCachedVidHeapControlDataResidualListInitialized = 0;
+static int sResidualWasAllocated = 0;
+static NvU32 sCachedVidHeapControlDataResidualList_idx = 0;
+
+NV_STATUS RmQueryRecordedPMAAllocSize_init(void)
+{
+	sCachedVidHeapControlDataList_query_it =
+		listIterAll(&sCachedVidHeapControlDataList);
+	return NV_OK;
+}
+
+NV_STATUS RmQueryRecordedPMAAllocSize(NvU64 *pma_alloc_size)
+{
+	if (!listIterNext(&sCachedVidHeapControlDataList_query_it)) {
+		return NV_ERR_GENERIC;
+	}
+	if (sCachedVidHeapControlDataList_query_it.pValue == NULL) {
+		return NV_ERR_GENERIC;
+	}
+	*pma_alloc_size = sCachedVidHeapControlDataList_query_it.pValue
+				  ->alloc_data.data.AllocSize.size;
+	return NV_OK;
+}
+
+NV_STATUS RmQueryNumRecordedResiduals(NvU32 *residual_capacity,
+				      NvU32 *residual_idx)
+{
+	*residual_capacity = listCount(&sCachedVidHeapControlDataResidualList);
+	*residual_idx = sCachedVidHeapControlDataResidualList_idx;
+	return NV_OK;
+}
+
+NV_STATUS RmQueryCapturePMAAllocMode(NvU32 *capture_pma_alloc_mode)
+{
+	*capture_pma_alloc_mode = sCapturePMAAllocMode;
+	return NV_OK;
+}
+
+NV_STATUS RmCapturePMAAlloc(NvU32 capture_pma_alloc_mode)
+{
+	// This should not happen, as the file write operation already checks
+	// for the validity of the mode value, but we still add it just in case.
+	if (capture_pma_alloc_mode >= kEnd) {
+		return NV_ERR_GENERIC;
+	}
+	sCapturePMAAllocMode = capture_pma_alloc_mode;
+
+	if (sCapturePMAAllocMode == kReplay ||
+	    sCapturePMAAllocMode == kReplayNext ||
+	    sCapturePMAAllocMode == kReplayNextAndStashResiduals ||
+	    sCapturePMAAllocMode == kReplayNextAndAppendResiduals) {
+		if (sCachedVidHeapControlDataList_it.pValue == NULL) {
+#define ITERATOR_TO_LIST_BEGIN(iterator, iterator_type, list)             \
+	NV_PRINTF(LEVEL_ERROR,                                            \
+		  "Pointing the iterator to the head of the list\n");     \
+	iterator_type it = listIterAll(&list);                            \
+	NV_PRINTF(LEVEL_ERROR,                                            \
+		  "Replaying the previously recorded %d allocations [\n", \
+		  listCount(&list));                                      \
+	while (listIterNext(&it)) {                                       \
+		NV_PRINTF(LEVEL_ERROR, "  .size=%lld\n",                  \
+			  it.pValue->alloc_data.data.AllocSize.size);     \
+	}                                                                 \
+	NV_PRINTF(LEVEL_ERROR, "]\n");                                    \
+	iterator = listIterAll(&list)
+
+			ITERATOR_TO_LIST_BEGIN(sCachedVidHeapControlDataList_it,
+					       CachedVidHeapControlDataListIter,
+					       sCachedVidHeapControlDataList);
+			if (!listIterNext(&sCachedVidHeapControlDataList_it)) {
+				NV_PRINTF(
+					LEVEL_ERROR,
+					"Cached list is empty. Directly exiting.\n");
+				sCapturePMAAllocMode = kDefault;
+				return NV_ERR_GENERIC;
+			}
+		} else {
+			CachedVidHeapControlDataListIter it =
+				sCachedVidHeapControlDataList_it;
+			NV_PRINTF(LEVEL_ERROR,
+				  "Continuing on the current iterator [\n");
+			NV_PRINTF(LEVEL_ERROR, "  ...\n");
+			do {
+				NV_PRINTF(LEVEL_ERROR, "  .size=%lld\n",
+					  it.pValue->alloc_data.data.AllocSize
+						  .size);
+			} while (listIterNext(&it));
+			NV_PRINTF(LEVEL_ERROR, "]\n");
+		}
+	} else if (sCapturePMAAllocMode == kReplayResiduals) {
+		ITERATOR_TO_LIST_BEGIN(sCachedVidHeapControlDataResidualList_it,
+				       CachedVidHeapControlDataResidualListIter,
+				       sCachedVidHeapControlDataResidualList);
+		if (!listIterNext(&sCachedVidHeapControlDataResidualList_it)) {
+			sCachedVidHeapControlDataResidualList_it.pValue = NULL;
+		}
+
+		sCachedVidHeapControlDataResidualList_idx = 0;
+
+	} else if (sCapturePMAAllocMode == kClearRecords) {
+#define DESTRUCT_LIST(list)                                                   \
+	if (list##Initialized) {                                              \
+		NV_PRINTF(LEVEL_ERROR, "Deconstructing the cached list\n");   \
+		listDestroy(&list);                                           \
+		list##_it.pValue = NULL;                                      \
+		list##Initialized = 0;                                        \
+		sCapturePMAAllocMode = kDefault;                              \
+	} else {                                                              \
+		NV_PRINTF(LEVEL_ERROR, "The cached list is not initialized, " \
+				       "hence directly exiting\n");           \
+	}
+
+		DESTRUCT_LIST(sCachedVidHeapControlDataList);
+
+	} else if (sCapturePMAAllocMode == kClearListOfResiduals) {
+		DESTRUCT_LIST(sCachedVidHeapControlDataResidualList);
+		sCachedVidHeapControlDataResidualList_idx = 0;
+	}
+	return NV_OK;
+}
+
+NV_STATUS RmDupMemoryCallback(void)
+{
+	if (sCapturePMAAllocMode == kReplay) {
+		if (!listIterNext(&sCachedVidHeapControlDataList_it)) {
+			NV_PRINTF(LEVEL_ERROR,
+				  "Running out of the recorded allocations\n");
+			sCachedVidHeapControlDataList_it.pValue = NULL;
+			sCapturePMAAllocMode = kDefault;
+		}
+	} else if (sCapturePMAAllocMode == kReplayNext) {
+		if (!listIterNext(&sCachedVidHeapControlDataList_it)) {
+			sCachedVidHeapControlDataList_it.pValue = NULL;
+		}
+		sCapturePMAAllocMode = kDefault;
+	} else if (sCapturePMAAllocMode == kReplayNextAndStashResiduals) {
+		if (!listIterNext(&sCachedVidHeapControlDataList_it)) {
+			sCachedVidHeapControlDataList_it.pValue = NULL;
+		}
+		sCapturePMAAllocMode = kReplayResiduals;
+
+		ITERATOR_TO_LIST_BEGIN(sCachedVidHeapControlDataResidualList_it,
+				       CachedVidHeapControlDataResidualListIter,
+				       sCachedVidHeapControlDataResidualList);
+		if (!listIterNext(&sCachedVidHeapControlDataResidualList_it)) {
+			sCachedVidHeapControlDataResidualList_it.pValue = NULL;
+		}
+
+		sCachedVidHeapControlDataResidualList_idx = 0;
+
+	} else if (sCapturePMAAllocMode == kReplayNextAndAppendResiduals) {
+		if (!listIterNext(&sCachedVidHeapControlDataList_it)) {
+			sCachedVidHeapControlDataList_it.pValue = NULL;
+		}
+		sCapturePMAAllocMode = kReplayResiduals;
+
+		// Do NOT reset the iterator of the residual list.
+	} else if (sCapturePMAAllocMode == kReplayResiduals &&
+		   sResidualWasAllocated) {
+		sResidualWasAllocated = 0;
+		if (!listIterNext(&sCachedVidHeapControlDataResidualList_it)) {
+			NV_PRINTF(LEVEL_ERROR,
+				  "Running out of the recorded allocations\n");
+			sCachedVidHeapControlDataResidualList_it.pValue = NULL;
+			// Do not go to default mode yet, since the number of
+			// residuals could grow dynamically.
+			//
+			//     sCapturePMAAllocMode = kDefault;
+		}
+
+		NV_PRINTF(
+			LEVEL_ERROR,
+			"sCachedVidHeapControlDataResidualList_idx: %d -> %d\n",
+			sCachedVidHeapControlDataResidualList_idx,
+			sCachedVidHeapControlDataResidualList_idx + 1);
+		sCachedVidHeapControlDataResidualList_idx += 1;
+
+		// sCachedVidHeapControlDataResidualList_it =
+		// 	sCachedVidHeapControlDataResidualList_it_next;
+	}
+	return NV_OK;
+}
+
+NV_STATUS RmMapToMaterializedhMemory(NvHandle shadow_hmemory,
+				     NvHandle *materialized_hmemory)
+{
+	if (sCapturePMAAllocMode == kReplay ||
+	    sCapturePMAAllocMode == kReplayNext ||
+	    sCapturePMAAllocMode == kReplayNextAndStashResiduals ||
+	    sCapturePMAAllocMode == kReplayNextAndAppendResiduals) {
+#define GET_MATERIALIZED_HMEMORY_FROM_ITERATOR(iterator)                    \
+	if (iterator.pValue != NULL &&                                      \
+	    shadow_hmemory == iterator.pValue->shadow_hmemory) {            \
+		*materialized_hmemory =                                     \
+			iterator.pValue->alloc_data.data.AllocSize.hMemory; \
+		return NV_OK;                                               \
+	} else {                                                            \
+		NV_PRINTF(LEVEL_ERROR,                                      \
+			  "Shadow memory handle=0x%x not found\n",          \
+			  shadow_hmemory);                                  \
+	}
+
+		GET_MATERIALIZED_HMEMORY_FROM_ITERATOR(
+			sCachedVidHeapControlDataList_it);
+
+	} // if (sCapturePMAAllocMode == kReplay ||
+	  //     sCapturePMAAllocMode == kReplayNext ||
+	  //     sCapturePMAAllocMode == kReplayNextAndStashResiduals ||
+	  //     sCapturePMAAllocMode == kReplayNextAndAppendResiduals)
+	else if (sCapturePMAAllocMode == kReplayResiduals) {
+		GET_MATERIALIZED_HMEMORY_FROM_ITERATOR(
+			sCachedVidHeapControlDataResidualList_it);
+	}
+	return NV_ERR_GENERIC;
+}
+
+// clang-format off
+// </bojian/Grape>
+
 NV_STATUS RmIoctl(
     nv_state_t  *nv,
     nv_file_private_t *nvfp,
@@ -292,6 +538,19 @@ NV_STATUS RmIoctl(
 {
     NV_STATUS            rmStatus = NV_ERR_GENERIC;
     API_SECURITY_INFO    secInfo = { };
+
+    // <bojian/Grape>
+	// clang-format on
+
+	// Check whether the memory allocations belong to residual, each having
+	// the size of 1 MB.
+#define NV_RESIDUAL_MALLOC_SIZE (1 * 1024 * 1024)
+#define NV_HUGE_PAGE_SIZE (2 * 1024 * 1024)
+
+	VidHeapCtrlDataWithShadowMemoryHandle cached_vid_heap_control_data = {};
+
+	// clang-format off
+    // </bojian/Grape>
 
     secInfo.privLevel = osIsAdministrator() ? RS_PRIV_LEVEL_USER_ROOT : RS_PRIV_LEVEL_USER;
     secInfo.paramLocation = PARAM_LOCATION_USER;
@@ -433,7 +692,37 @@ NV_STATUS RmIoctl(
                 goto done;
             }
 
+        // <bojian/Grape>
+		// clang-format on
+
+		NVOS00_PARAMETERS old_param = *pApi;
+
+		// clang-format off
+        // </bojian/Grape>
+
             Nv01FreeWithSecInfo(pApi, secInfo);
+
+        // <bojian/Grape>
+		// clang-format on
+
+#define TRACK_pAPI_CHANGES(new_member, old_member, fmt_str)          \
+	if (new_member != old_member) {                              \
+		NV_PRINTF(LEVEL_ERROR,                               \
+			  #old_member "=" fmt_str " -> " #new_member \
+				      "=" fmt_str "\n",              \
+			  old_member, new_member);                   \
+	}
+
+		// Dump the changes after the `Nv01FreeWithSecInfo` API call.
+		TRACK_pAPI_CHANGES(pApi->hObjectOld, old_param.hObjectOld,
+				   "%d");
+		TRACK_pAPI_CHANGES(pApi->hObjectParent, old_param.hObjectParent,
+				   "%d");
+		TRACK_pAPI_CHANGES(pApi->hRoot, old_param.hRoot, "%d");
+		TRACK_pAPI_CHANGES(pApi->status, old_param.status, "%d");
+
+		// clang-format off
+        // </bojian/Grape>
 
             if (pApi->status == NV_OK &&
                 pApi->hObjectOld == pApi->hRoot)
@@ -456,10 +745,239 @@ NV_STATUS RmIoctl(
                 goto done;
             }
 
+        // <bojian/Grape>
+		// clang-format on
+
+		NVOS32_PARAMETERS old_params = *pApi;
+
+// Check whether the attribute matches the given value.
+#define CHECK_ATTR_NE_VALUE(attr, bits_begin, bits_end, value) \
+	((((attr) << (31 - (bits_begin))) >>                   \
+	  (31 + (bits_end) - (bits_begin))) ^                  \
+	 value)
+
+#define CHECK_ATTR_EQ_VALUE(attr, bits_begin, bits_end, value) \
+	(!CHECK_ATTR_NE_VALUE(attr, bits_begin, bits_end, value))
+
+		/// @sa src/common/sdk/nvidia/inc/nvos.h
+		NvU32 pApiUsesDefaultPageSize =
+			CHECK_ATTR_EQ_VALUE(pApi->data.AllocSize.attr, 24, 23,
+					    NVOS32_ATTR_PAGE_SIZE_DEFAULT);
+		NvU32 pApiIsLocatedOnVidMem =
+			CHECK_ATTR_EQ_VALUE(pApi->data.AllocSize.attr, 26, 25,
+					    NVOS32_ATTR_LOCATION_VIDMEM);
+
+		if ((sCapturePMAAllocMode == kReplay ||
+		     sCapturePMAAllocMode == kReplayNext ||
+		     sCapturePMAAllocMode == kReplayNextAndStashResiduals ||
+		     sCapturePMAAllocMode == kReplayNextAndAppendResiduals) &&
+		    pApiUsesDefaultPageSize && pApiIsLocatedOnVidMem) {
+			NV_PRINTF(LEVEL_ERROR,
+				  "Taping out the recorded parameters\n");
+			if (sCachedVidHeapControlDataList_it.pValue == NULL) {
+				NV_PRINTF(
+					LEVEL_ERROR,
+					"Running out of cached allocations. Directly exiting.\n");
+				break;
+			}
+
+#define COPY_ITERATOR_TO_pAPI(iterator)                                     \
+	pApi->data.AllocSize.attr =                                         \
+		iterator.pValue->alloc_data.data.AllocSize.attr;            \
+	pApi->data.AllocSize.format =                                       \
+		iterator.pValue->alloc_data.data.AllocSize.format;          \
+	pApi->data.AllocSize.partitionStride =                              \
+		iterator.pValue->alloc_data.data.AllocSize.partitionStride; \
+	pApi->data.AllocSize.offset =                                       \
+		iterator.pValue->alloc_data.data.AllocSize.offset;          \
+	pApi->data.AllocSize.limit =                                        \
+		iterator.pValue->alloc_data.data.AllocSize.limit;           \
+	pApi->data.AllocSize.attr2 =                                        \
+		iterator.pValue->alloc_data.data.AllocSize.attr2;           \
+	iterator.pValue->shadow_hmemory = pApi->data.AllocSize.hMemory;     \
+	break
+
+			COPY_ITERATOR_TO_pAPI(sCachedVidHeapControlDataList_it);
+		}
+
+		if (sCapturePMAAllocMode == kReplayResiduals &&
+		    pApiUsesDefaultPageSize && pApiIsLocatedOnVidMem) {
+			if (sCachedVidHeapControlDataResidualList_it.pValue !=
+			    NULL) {
+				sResidualWasAllocated = 1;
+				COPY_ITERATOR_TO_pAPI(
+					sCachedVidHeapControlDataResidualList_it);
+			}
+		}
+
+		if (sCapturePMAAllocMode == kProbeNext &&
+		    pApiUsesDefaultPageSize && pApiIsLocatedOnVidMem) {
+			NV_PRINTF(LEVEL_ERROR,
+				  "Probing the size of the allocation\n");
+			cached_vid_heap_control_data.alloc_data = *pApi;
+
+			if (!sCachedVidHeapControlDataListInitialized) {
+				listInit(&sCachedVidHeapControlDataList,
+					 portMemAllocatorGetGlobalNonPaged());
+				sCachedVidHeapControlDataListInitialized = 1;
+			}
+			if (listAppendValue(&sCachedVidHeapControlDataList,
+					    &cached_vid_heap_control_data) ==
+			    NULL) {
+				NV_PRINTF(
+					LEVEL_ERROR,
+					"Failed to insert to the list due to insufficient resources\n");
+			}
+			sCapturePMAAllocMode = kDefault;
+			break;
+		}
+
+#define NV_ALIGN_RESIDUALS_TO_HUGE_PAGE 0
+
+		// Change the size of residual allocations from 1 MB to align
+		// with the huge page size (i.e., 2 MB) so that they could be
+		// replayed using the `cudaMalloc` calls.
+#if NV_ALIGN_RESIDUALS_TO_HUGE_PAGE
+		if (sCapturePMAAllocMode == kRecord &&
+		    pApiUsesDefaultPageSize && pApiIsLocatedOnVidMem &&
+		    listCount(&sCachedVidHeapControlDataList) >= 1) {
+			if (pApi->data.AllocSize.size ==
+			    NV_RESIDUAL_MALLOC_SIZE) {
+				pApi->data.AllocSize.size = NV_HUGE_PAGE_SIZE;
+			}
+		}
+#endif // defined(NV_ALIGN_RESIDUALS_TO_HUGE_PAGE)
+
+		// clang-format off
+        // </bojian/Grape>
+
             if (pApi->function == NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR)
                 RmCreateOsDescriptor(pApi, secInfo);
             else
                 Nv04VidHeapControlWithSecInfo(pApi, secInfo);
+
+        // <bojian/Grape>
+		// clang-format on
+
+		if ((sCapturePMAAllocMode == kRecord ||
+		     sCapturePMAAllocMode == kRecordNextAndOverwrite ||
+		     sCapturePMAAllocMode == kReplayResiduals) &&
+		    pApiUsesDefaultPageSize && pApiIsLocatedOnVidMem) {
+			// Here we only track changes of members that have been
+			// marked as [OUT],
+			TRACK_pAPI_CHANGES(pApi->status, old_params.status,
+					   "%d");
+			TRACK_pAPI_CHANGES(pApi->total, old_params.total,
+					   "%lld");
+			TRACK_pAPI_CHANGES(pApi->free, old_params.free, "%lld");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.hMemory,
+					   old_params.data.AllocSize.hMemory,
+					   "0x%x");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.attr,
+					   old_params.data.AllocSize.attr,
+					   "0x%x");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.format,
+					   old_params.data.AllocSize.format,
+					   "0x%x");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.comprCovg,
+					   old_params.data.AllocSize.comprCovg,
+					   "%d");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.zcullCovg,
+					   old_params.data.AllocSize.zcullCovg,
+					   "%d");
+			TRACK_pAPI_CHANGES(
+				pApi->data.AllocSize.partitionStride,
+				old_params.data.AllocSize.partitionStride,
+				"%d");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.size,
+					   old_params.data.AllocSize.size,
+					   "%lld");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.offset,
+					   old_params.data.AllocSize.offset,
+					   "0x%llx");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.limit,
+					   old_params.data.AllocSize.limit,
+					   "%lld");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.address,
+					   old_params.data.AllocSize.address,
+					   "%p");
+			TRACK_pAPI_CHANGES(pApi->data.AllocSize.attr2,
+					   old_params.data.AllocSize.attr2,
+					   "0x%x");
+			cached_vid_heap_control_data.alloc_data = *pApi;
+
+			if (sCapturePMAAllocMode == kRecord) {
+#define INITIALIZE_LIST_AND_APPEND_VALUE(list)                                           \
+	if (!list##Initialized) {                                                        \
+		listInit(&list, portMemAllocatorGetGlobalNonPaged());                    \
+		list##Initialized = 1;                                                   \
+	}                                                                                \
+	if (listAppendValue(&list, &cached_vid_heap_control_data) == NULL) {             \
+		NV_PRINTF(                                                               \
+			LEVEL_ERROR,                                                     \
+			"Failed to insert to the list due to insufficient resources\n"); \
+	}
+
+				INITIALIZE_LIST_AND_APPEND_VALUE(
+					sCachedVidHeapControlDataList);
+			} else if (sCapturePMAAllocMode ==
+				   kRecordNextAndOverwrite) {
+				NV_PRINTF(
+					LEVEL_ERROR,
+					"Attempting to modify the previous record\n");
+
+				if (sCachedVidHeapControlDataList_it.pValue ==
+				    NULL) {
+					NV_PRINTF(
+						LEVEL_ERROR,
+						"Pointing the iterator to the head of the list\n");
+					ITERATOR_TO_LIST_BEGIN(
+						sCachedVidHeapControlDataList_it,
+						CachedVidHeapControlDataListIter,
+						sCachedVidHeapControlDataList);
+					if (!listIterNext(
+						    &sCachedVidHeapControlDataList_it)) {
+						NV_PRINTF(
+							LEVEL_ERROR,
+							"Cached list is empty. Directly exiting.\n");
+						sCapturePMAAllocMode = kDefault;
+						return NV_ERR_GENERIC;
+					}
+				} // sCachedVidHeapControlDataList_it.pValue ==
+				  // NULL
+				sCachedVidHeapControlDataList_it.pValue
+					->alloc_data = *pApi;
+				sCapturePMAAllocMode = kDefault;
+			} else if (sCapturePMAAllocMode == kReplayResiduals &&
+				   pApi->data.AllocSize.size ==
+					   2 * 1024 * 1024) {
+				NV_PRINTF(
+					LEVEL_ERROR,
+					"Appending to the current list of residuals\n");
+				sResidualWasAllocated = 1;
+
+				INITIALIZE_LIST_AND_APPEND_VALUE(
+					sCachedVidHeapControlDataResidualList);
+
+				sCachedVidHeapControlDataResidualList_it = listIterAll(
+					&sCachedVidHeapControlDataResidualList);
+				CachedVidHeapControlDataResidualListIter
+					sCachedVidHeapControlDataResidualList_it_next =
+						sCachedVidHeapControlDataResidualList_it;
+				while (listIterNext(
+					&sCachedVidHeapControlDataResidualList_it_next)) {
+					sCachedVidHeapControlDataResidualList_it =
+						sCachedVidHeapControlDataResidualList_it_next;
+				}
+			} // if (sCapturePMAAllocMode == kRecord)
+		} // if ((sCapturePMAAllocMode == kRecord ||
+		  //      sCapturePMAAllocMode == kReplayResiduals) &&
+		  //     pApiUsesDefaultPageSize && pApiIsLocatedOnVidMem)
+
+#undef TRACK_pAPI_CHANGES
+
+		// clang-format off
+        // </bojian/Grape>
 
             break;
         }

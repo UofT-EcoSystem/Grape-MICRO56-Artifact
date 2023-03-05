@@ -407,6 +407,8 @@ NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_allocation(nvidia_stack_t *sp,
     return rmStatus;
 }
 
+extern NV_STATUS RmDupMemoryCallback(void); // <bojian/Grape>
+
 NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_memory (nvidia_stack_t *sp,
                                                gpuDeviceHandle device,
                                                NvHandle hClient,
@@ -418,6 +420,14 @@ NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_memory (nvidia_stack_t *sp,
     void *fp;
     NV_ENTER_RM_RUNTIME(sp,fp);
     rmStatus = nvGpuOpsDupMemory(device, hClient, hPhysMemory, hDupMemory, gpuMemoryInfo);
+
+    // <bojian/Grape>
+    if (RmDupMemoryCallback() != NV_OK) {
+	    NV_PRINTF(LEVEL_ERROR, "hPhysMemory=0x%x -> hDupMemory=0x%x\n",
+		      hPhysMemory, *hDupMemory);
+    }
+    // </bojian/Grape>
+
     NV_EXIT_RM_RUNTIME(sp,fp);
     return rmStatus;
 }

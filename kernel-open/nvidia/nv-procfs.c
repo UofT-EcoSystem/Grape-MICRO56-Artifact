@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -33,6 +34,9 @@
 #include "nv-reg.h"
 #include "conftest/patches.h"
 #include "nv-ibmnpu.h"
+
+// <bojian/Grape>
+#include "../../src/nvidia/arch/nvalloc/unix/src/NVCapturePMAAllocMode.h"
 
 #define NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(name) \
     NV_DEFINE_SINGLE_PROCFS_FILE_READ_ONLY(name, nv_system_pm_lock)
@@ -188,6 +192,112 @@ nv_procfs_read_gpu_info(
 }
 
 NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(gpu_info);
+
+// <bojian/Grape>
+// clang-format on
+#define C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE 4096
+#define C_NV_CAPTURE_PMA_ALLOC_PROC_FILENAME "capture_pma_alloc"
+
+static char
+	sNVCapturePMAAllocKBuffer[C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE];
+
+static ssize_t _nv_capture_pma_alloc_proc_file_read(struct file *file2read,
+						    char __user *ubuf,
+						    size_t count,
+						    loff_t *offset)
+{
+	int kbuf_len = 0;
+	NvU32 capture_pma_alloc_mode = 0;
+	NvU64 pma_alloc_size = 0;
+	NvU32 residual_capacity = 0, residual_idx = 0;
+
+	nv_printf(
+		NV_DBG_ERRORS,
+		"Proc file read (/proc/driver/nvidia/gpus/XXXX:XX:XX.X/" C_NV_CAPTURE_PMA_ALLOC_PROC_FILENAME
+		") called, with count=%ld and offset=%lld\n",
+		count, *offset);
+	// Since `count` is usually in the chunk of 128 KB, it is more than
+	// enough to satisfy the requirements.
+	if (*offset > 0 ||
+	    count < C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE) {
+		return 0;
+	}
+
+	// Invoke the OS API.
+	rm_query_capture_pma_alloc_mode(&capture_pma_alloc_mode);
+	rm_query_num_recorded_residuals(&residual_capacity, &residual_idx);
+	kbuf_len +=
+		snprintf(sNVCapturePMAAllocKBuffer + kbuf_len,
+			 C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE - kbuf_len,
+			 "%d \n", capture_pma_alloc_mode);
+	kbuf_len +=
+		snprintf(sNVCapturePMAAllocKBuffer + kbuf_len,
+			 C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE - kbuf_len,
+			 "%d \n", residual_capacity);
+	kbuf_len +=
+		snprintf(sNVCapturePMAAllocKBuffer + kbuf_len,
+			 C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE - kbuf_len,
+			 "%d \n", residual_idx);
+	rm_query_recorded_pma_alloc_size_init();
+	while (rm_query_recorded_pma_alloc_size(&pma_alloc_size) == NV_OK) {
+		kbuf_len += snprintf(
+			sNVCapturePMAAllocKBuffer + kbuf_len,
+			C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE - kbuf_len,
+			"%lld \n", pma_alloc_size);
+	}
+
+	if (copy_to_user(ubuf, sNVCapturePMAAllocKBuffer, kbuf_len)) {
+		return -EFAULT;
+	}
+	*offset = kbuf_len;
+	return kbuf_len;
+}
+
+static ssize_t _nv_capture_pma_alloc_proc_file_write(struct file *file2write,
+						     const char __user *ubuf,
+						     size_t count,
+						     loff_t *offset)
+{
+	NvU32 capture_pma_alloc_mode = 0;
+
+	nv_printf(
+		NV_DBG_ERRORS,
+		"Proc file write (/proc/driver/nvidia/gpus/XXXX:XX:XX.X/" C_NV_CAPTURE_PMA_ALLOC_PROC_FILENAME
+		") called, with count=%ld and offset=%lld\n",
+		count, *offset);
+
+	if (*offset > 0 ||
+	    count > C_NV_CAPTURE_PMA_ALLOC_PROC_BUFFER_MAX_SIZE) {
+		return -EFAULT;
+	}
+	if (copy_from_user(sNVCapturePMAAllocKBuffer, ubuf, count)) {
+		return -EFAULT;
+	}
+
+	if (sscanf(sNVCapturePMAAllocKBuffer, "%d", &capture_pma_alloc_mode) !=
+	    1) {
+		return -EFAULT;
+	}
+
+	// Invoke the OS API.
+	if (rm_capture_pma_alloc(capture_pma_alloc_mode) != NV_OK) {
+		return -EFAULT;
+	}
+
+	nv_printf(NV_DBG_ERRORS, "NVCapturePMAAllocMode -> %s\n",
+		  NVCapturePMAAllocMode2CStr[capture_pma_alloc_mode]);
+	*offset = count;
+	return count;
+}
+
+static const nv_proc_ops_t _nv_capture_pma_alloc_proc_ops = {
+	NV_PROC_OPS_SET_OWNER().NV_PROC_OPS_READ =
+		_nv_capture_pma_alloc_proc_file_read,
+	.NV_PROC_OPS_WRITE = _nv_capture_pma_alloc_proc_file_write
+};
+
+// clang-format off
+// </bojian/Grape>
 
 static int
 nv_procfs_read_power(
@@ -1398,6 +1508,17 @@ int nv_procfs_add_gpu(nv_linux_state_t *nvl)
     proc_nvidia_gpu = NV_CREATE_PROC_DIR(name, proc_nvidia_gpus);
     if (!proc_nvidia_gpu)
         goto failed;
+
+    // <bojian/Grape>
+	// clang-format on
+	entry = proc_create(C_NV_CAPTURE_PMA_ALLOC_PROC_FILENAME,
+			    S_IFREG | S_IRUGO | S_IWUGO, proc_nvidia_gpu,
+			    &_nv_capture_pma_alloc_proc_ops);
+	if (!entry) {
+		goto failed;
+	}
+	// clang-format off
+    // </bojian/Grape>
 
     entry = NV_CREATE_PROC_FILE("information", proc_nvidia_gpu, gpu_info,
                                 nv);

@@ -3,3 +3,12 @@
 *.o.cmd
 *.o.d
 _out/
+
+# Compilation Database
+compile_commands.json
+
+# NVIDIA Driver Installation Runfile
+NVIDIA-Linux-x86_64-*.run
+
+# Key
+x509.genkey

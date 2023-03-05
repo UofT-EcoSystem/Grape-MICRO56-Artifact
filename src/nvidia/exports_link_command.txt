@@ -17,6 +17,11 @@
 --undefined=rm_init_private_state
 --undefined=rm_init_rm
 --undefined=rm_vgpu_vfio_set_driver_vm
+--undefined=rm_query_recorded_pma_alloc_size_init
+--undefined=rm_query_recorded_pma_alloc_size
+--undefined=rm_query_num_recorded_residuals
+--undefined=rm_query_capture_pma_alloc_mode
+--undefined=rm_capture_pma_alloc
 --undefined=rm_ioctl
 --undefined=rm_is_supported_device
 --undefined=rm_is_supported_pci_device

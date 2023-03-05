@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2015-2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
@@ -386,6 +387,12 @@ clientGetResourceByRef_IMPL
     return NV_OK;
 }
 
+// clang-format on
+extern NV_STATUS
+RmMapToMaterializedhMemory(NvHandle shadow_hmemory,
+			   NvHandle *materialized_hmemory); // <bojian/Grape>
+// clang-format off
+
 NV_STATUS
 clientGetResourceRef_IMPL
 (
@@ -397,8 +404,35 @@ clientGetResourceRef_IMPL
     RsResourceRef *pResourceRef;
 
     pResourceRef = mapFind(&pClient->resourceMap, hResource);
-    if (pResourceRef == NULL)
+    if (pResourceRef == NULL) {
+
+        // <bojian/Grape>
+		// clang-format on
+		// Map the handle to the materialized handle.
+		NvHandle hMaterializedResource;
+
+		if (hResource != 0x0 &&
+		    RmMapToMaterializedhMemory(
+			    hResource, &hMaterializedResource) == NV_OK) {
+			NV_PRINTF(
+				LEVEL_ERROR,
+				"hShadowResource=0x%x -> hMaterializedResource=0x%x\n",
+				hResource, hMaterializedResource);
+			pResourceRef = mapFind(&pClient->resourceMap,
+					       hMaterializedResource);
+			if (pResourceRef == NULL) {
+				return NV_ERR_OBJECT_NOT_FOUND;
+			}
+			if (ppResourceRef != NULL) {
+				*ppResourceRef = pResourceRef;
+			}
+			return NV_OK;
+		}
+		// clang-format off
+        // </bojian/Grape>
+
         return NV_ERR_OBJECT_NOT_FOUND;
+    }
 
     if (ppResourceRef != NULL)
         *ppResourceRef = pResourceRef;
