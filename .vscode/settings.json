@@ -1,0 +1,9 @@
+{
+        "pylint.args": [
+                "--rcfile=${workspaceFolder}/submodules/quik_fix/.pylintrc",
+                "--init-hook",
+                "import sys; pwd = '${workspaceFolder}'; sys.path.extend([pwd + '/submodules/quik_fix', pwd + '/submodules/pytorch', pwd + '/submodules/transformers/src'])",
+                "--generated-members=torch.*"
+        ],
+        "python.envFile": "${workspaceFolder}/.vscode/.env",
+}

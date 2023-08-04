@@ -1,0 +1,9 @@
+Name,Attrs,Avg,Std,min,Median,MAX
+Baseline,"{""platform"": ""CentML""}",4.638e-01,3.375e-03,4.614e-01,4.615e-01,4.686e-01
+CUDAGraph,"{""platform"": ""CentML""}",4.361e-01,3.150e-03,4.338e-01,4.339e-01,4.405e-01
+Baseline,"{""platform"": ""g5""}",1.264e+00,1.937e-03,1.261e+00,1.265e+00,1.266e+00
+CUDAGraph,"{""platform"": ""g5""}",6.333e-01,1.466e-03,6.320e-01,6.325e-01,6.353e-01
+Baseline,"{""platform"": ""eco""}",2.784e+00,2.064e-02,2.768e+00,2.771e+00,2.813e+00
+CUDAGraph,"{""platform"": ""eco""}",2.769e+00,1.171e-03,2.768e+00,2.769e+00,2.771e+00
+Baseline,"{""platform"": ""UofT""}",1.242e+00,1.070e-02,1.229e+00,1.241e+00,1.255e+00
+CUDAGraph,"{""platform"": ""UofT""}",4.851e-01,1.927e-03,4.826e-01,4.856e-01,4.872e-01

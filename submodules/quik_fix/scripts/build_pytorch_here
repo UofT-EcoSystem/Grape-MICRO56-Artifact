@@ -1,0 +1,76 @@
+#!/bin/bash -e
+
+NVCC_ARCHS=
+INSTALL_DIR=
+
+while [[ $# -gt 0 ]]; do
+        case $1 in
+        --nvcc-archs)
+                NVCC_ARCHS=$2
+                shift
+                shift
+                ;;
+        --nvcc-archs=*)
+                NVCC_ARCHS=${1#*=}
+                shift
+                ;;
+        -j | --jobs)
+                MAX_JOBS=$2
+                shift
+                shift
+                ;;
+        -j=* | --jobs=*)
+                MAX_JOBS=${1#*=}
+                shift
+                ;;
+        --local)
+                echo "Using user site as the installation path"
+                INSTALL_DIR="--install-dir $(python3 -m site --user-site || true)"
+                shift
+                ;;
+        *)
+                echo "Usage: pytorch_build --nvcc-archs xxx [--jobs xxx] [--init-submodules], but got $1"
+                exit -1
+                ;;
+        esac
+done
+
+if [ -z ${NVCC_ARCHS} ] && [ -x $(command -v __nvcc_device_query) ]; then
+        echo "NVCC_ARCHS is empty. Querying from __nvcc_device_query ..."
+        NVCC_ARCHS=$(__nvcc_device_query)
+        NVCC_ARCHS="${NVCC_ARCHS::-1}.${NVCC_ARCHS: -1}"
+fi
+
+if [ -z ${NVCC_ARCHS} ]; then
+        echo "NVCC archs have to be provided using --nvcc-archs"
+        exit -1
+fi
+
+if [ -z ${MAX_JOBS} ]; then
+        MAX_JOBS=$(nproc)
+fi
+
+function bold_text() {
+        echo "$(tput bold)$1$(tput sgr0)"
+}
+
+echo "Building with NVCC_ARCHS="$(bold_text ${NVCC_ARCHS}) "and using" $(bold_text ${MAX_JOBS}) "threads"
+
+export USE_CUDA=1 USE_CUDNN=1 \
+        TORCH_CUDA_ARCH_LIST="${NVCC_ARCHS}" \
+        BUILD_CAFFE2=0 \
+        BUILD_CAFFE2_OPS=0 \
+        BUILD_TEST=0 \
+        USE_MKLDNN=0 \
+        USE_NNPACK=0 \
+        USE_QNNPACK=0 \
+        USE_XNNPACK=0 \
+        USE_FBGEMM=0 \
+        USE_DISTRIBUTED=0 \
+        USE_NCCL=0 \
+        USE_TENSORPIPE=0 \
+        USE_GLOO=0 \
+        USE_MPI=0 \
+        MAX_JOBS=${MAX_JOBS}
+
+python setup.py develop ${INSTALL_DIR}

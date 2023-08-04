@@ -1,0 +1,9 @@
+[submodule "submodules/open-gpu-kernel-modules"]
+	path = submodules/open-gpu-kernel-modules
+	url = https://github.com/UofT-EcoSystem/Grape-MICRO56-Artifact
+[submodule "submodules/pytorch"]
+	path = submodules/pytorch
+	url = https://github.com/UofT-EcoSystem/Grape-MICRO56-Artifact
+[submodule "submodules/transformers"]
+	path = submodules/transformers
+	url = https://github.com/UofT-EcoSystem/Grape-MICRO56-Artifact

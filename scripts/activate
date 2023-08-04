@@ -1,0 +1,26 @@
+PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE[0]})/.. && pwd)
+
+source ${PROJECT_ROOT}/scripts/hl.sh
+
+export PYTHONPATH="\
+${PROJECT_ROOT}/submodules/pytorch:\
+${PROJECT_ROOT}/submodules/quik_fix:\
+${PROJECT_ROOT}/submodules/transformers/src"
+
+export _OLD_PS1=${_OLD_PS1-${PS1-}}
+export PS1="($(bold Grape)) ${_OLD_PS1}"
+
+export _OLD_PATH=${_OLD_PATH-${PATH-}}
+export PATH="${_OLD_PATH}:\
+${PROJECT_ROOT}/submodules/quik_fix/scripts:\
+${PROJECT_ROOT}/submodules/quik_fix/scripts/nsys:\
+/usr/local/cuda/bin"
+
+export _OLD_LD_LIBRARY_PATH=${_OLD_LD_LIBRARY_PATH-${LD_LIBRARY_PATH-}}
+export LD_LIBRARY_PATH="${_OLD_LD_LIBRARY_PATH}:\
+/usr/local/nvidia/lib:\
+/usr/local/nvidia/lib64"
+
+export _OLD_LIBRARY_PATH=${_OLD_LIBRARY_PATH-${LIBRARY_PATH-}}
+export LIBRARY_PATH="${_OLD_LIBRARY_PATH}:\
+/usr/local/cuda/lib64/stubs"

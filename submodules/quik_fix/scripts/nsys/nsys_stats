@@ -1,0 +1,47 @@
+#!/bin/bash -e
+
+while [[ $# -gt 0 ]]; do
+        case $1 in
+        --report)
+                REPORT_METRICES=$2
+                shift
+                shift
+                ;;
+        --report=*)
+                REPORT_METRICES=${1#*=}
+                shift
+                ;;
+        *.sqlite)
+                SQLITE_FILENAME="$1"
+                SQLITE_FILENAME_BASENAME=$(basename ${SQLITE_FILENAME} .sqlite)
+                shift
+                ;;
+        *)
+                echo "Unrecognized argument: $1"
+                exit -1
+                ;;
+        esac
+done
+
+function bold_text() {
+        echo "$(tput bold)$1$(tput sgr0)"
+}
+
+if [ -z ${SQLITE_FILENAME} ]; then
+        echo "Usage: nsys_stats" $(bold_text "sqlite_file") "[--report metrics]"
+        exit -1
+fi
+
+REPORT_METRICES=${REPORT_METRICES:-gpukernsum,gputrace,cudaapisum,cudaapitrace}
+
+IFS=','
+
+for metric in ${REPORT_METRICES}; do
+        echo "Reporting" $(bold_text ${metric}) "from" $(bold_text ${SQLITE_FILENAME_BASENAME})
+        nsys stats --format csv --report ${metric} \
+                ${SQLITE_FILENAME_BASENAME}.sqlite \
+                >${SQLITE_FILENAME_BASENAME}-${metric}.csv.tmp
+        tail -n +2 ${SQLITE_FILENAME_BASENAME}-${metric}.csv.tmp \
+                >${SQLITE_FILENAME_BASENAME}-${metric}.csv
+        rm -f ${SQLITE_FILENAME_BASENAME}-${metric}.csv.tmp
+done

@@ -1,0 +1,93 @@
+#!/bin/bash -e
+
+PROGRAM_ARGUMENTS=()
+PROFILE_FROM_START=1
+PROGRAM_ARGUMENTS_START=0
+
+while [[ $# -gt 0 ]]; do
+        if [ ${PROGRAM_ARGUMENTS_START} == '1' ]; then
+                PROGRAM_ARGUMENTS+=($1)
+                shift
+                continue
+        fi
+        case $1 in
+        -o | --output)
+                OUTPUT_FILENAME=$2
+                shift
+                shift
+                ;;
+        -o=* | --output=*)
+                OUTPUT_FILENAME=${1#*=}
+                shift
+                ;;
+        --profile-from-start)
+                PROFILE_FROM_START=$2
+                shift
+                shift
+                ;;
+        --profile-from-start=*)
+                PROFILE_FROM_START=${1#*=}
+                shift
+                ;;
+        *)
+                PROGRAM_ARGUMENTS+=($1)
+                PROGRAM_ARGUMENTS_START=1
+                shift
+                ;;
+        esac
+done
+
+OUTPUT_FILENAME=${OUTPUT_FILENAME:-tmp}
+PROFILE_FROM_START=${PROFILE_FROM_START:-1}
+NSYS_CAPTURE_PROFILER_API=""
+
+function bold_text() {
+        echo "$(tput bold)$1$(tput sgr0)"
+}
+
+FLATTENED_PROGRAM_ARGUMENTS=${PROGRAM_ARGUMENTS[@]}
+echo "Profiling application" $(bold_text "${FLATTENED_PROGRAM_ARGUMENTS}")
+echo "Output Filename:" $(bold_text ${OUTPUT_FILENAME})
+
+python3 -m quik_fix.formatter negative "\
+Note that turning on the profiler can negatively affect the performance on the CPU side. \
+Please be weary."
+
+echo -n "Profile from start?: "
+
+if [ ${PROFILE_FROM_START} == "1" ]; then
+        echo $(bold_text "Yes")
+elif [ ${PROFILE_FROM_START} == "0" ]; then
+        echo $(bold_text "No (cudaProfilerStart/Stop required)")
+        NSYS_CAPTURE_PROFILER_API="--capture-range=cudaProfilerApi --capture-range-end=stop"
+else
+        echo "Unrecognized PROFILE_FROM_START value:" $(bold_text ${PROFILE_FROM_START})
+        exit -1
+fi
+
+if [ -z ${PROGRAM_ARGUMENTS} ]; then
+        echo "No program to run. Early exit."
+        exit -1
+fi
+
+rm -f ${OUTPUT_FILENAME}.sqlite ${OUTPUT_FILENAME}.nsys-rep
+
+export NVPROF_UNDERWAY=1
+
+PROGRAM_EXIT_CODE=0
+# Disable CPU profiling.
+(nsys profile --sample none --cpuctxsw none \
+        --export sqlite \
+        --trace cuda,nvtx \
+        --force-overwrite true \
+        ${NSYS_CAPTURE_PROFILER_API} \
+        --output ${OUTPUT_FILENAME} \
+        ${PROGRAM_ARGUMENTS[@]}) || PROGRAM_EXIT_CODE=$?
+
+export NVPROF_UNDERWAY=0
+
+if [ -f ${OUTPUT_FILENAME}.sqlite ]; then
+        nsys_stats ${OUTPUT_FILENAME}.sqlite
+fi
+
+exit ${PROGRAM_EXIT_CODE}

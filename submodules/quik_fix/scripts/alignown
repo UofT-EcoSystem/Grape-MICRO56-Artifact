@@ -1,0 +1,24 @@
+#!/bin/bash -e
+
+CWD=$(pwd)
+PROJECT_ROOT=${CWD}
+
+get_project_root() {
+        local GIT_ROOT=$(cd ${CWD} && git rev-parse --show-toplevel || true)
+
+        if [ ! -z ${GIT_ROOT} ]; then
+                PROJECT_ROOT=${GIT_ROOT}
+                CWD=${GIT_ROOT}/..
+                get_project_root
+        fi
+}
+
+get_project_root
+
+function bold_text() {
+        echo "$(tput bold)$1$(tput sgr0)"
+}
+
+echo -e "Project Root:" $(bold_text ${PROJECT_ROOT})
+
+chown -R $(stat -c %u:%g ${PROJECT_ROOT}) ${PROJECT_ROOT}

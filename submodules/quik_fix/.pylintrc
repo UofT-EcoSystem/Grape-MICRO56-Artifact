@@ -1,0 +1,12 @@
+[MAIN]
+
+disable=global-statement,
+        consider-using-f-string,
+        logging-fstring-interpolation,
+        logging-not-lazy,
+        missing-class-docstring,
+        missing-function-docstring,
+        missing-module-docstring,
+        protected-access,
+        unnecessary-dunder-call,
+        unspecified-encoding
