@@ -25,6 +25,22 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
+# <bojian/Grape>
+import os
+
+try:
+    from torch.cuda.graphs_ext import G_CUDA_GRAPH_MODULE_ARGS_CACHE
+except ImportError:
+    G_CUDA_GRAPH_MODULE_ARGS_CACHE = None
+
+
+def inline_module_args():
+    return False
+
+
+G_DECODER_LAYER_IDX = None
+
+
 from ...activations import ACT2FN
 from ...modeling_outputs import (
     BaseModelOutput,
@@ -171,8 +187,28 @@ class PegasusAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    def _shape(
+        self,
+        tensor: torch.Tensor,
+        seq_len: int,
+        bsz: int,
+        # <bojian/Grape>
+        dst_module_arg_idx=None,
+    ):
+        # <bojian/Grape>
+        # return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        seq_len = tensor.numel() // bsz // self.num_heads // self.head_dim
+        if dst_module_arg_idx is None or (seq_len,) not in G_CUDA_GRAPH_MODULE_ARGS_CACHE:
+            if dst_module_arg_idx is not None:
+                print(
+                    f"Unable to inline the past_key_values because seq_len={seq_len}"
+                    " does not yet exist in G_CUDA_GRAPH_MODULE_ARGS_CACHE"
+                )
+            return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+        dst_module_arg = G_CUDA_GRAPH_MODULE_ARGS_CACHE[(seq_len,)][dst_module_arg_idx]
+        dst_module_arg[:, :, :, :] = tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return dst_module_arg
 
     def forward(
         self,
@@ -200,18 +236,72 @@ class PegasusAttention(nn.Module):
             value_states = past_key_value[1]
         elif is_cross_attention:
             # cross_attentions
-            key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
-            value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
+            # <bojian/Grape>
+            # key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
+            # value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
+
+            k_proj_kv_states = self.k_proj(key_value_states)
+            key_states = self._shape(
+                k_proj_kv_states,
+                -1,
+                bsz,
+                # <bojian/Grape>
+                # 3 is for input_ids, encoder_hidden_state,
+                #          encoder_attention_mask
+                (3 + G_DECODER_LAYER_IDX * 4 + 2) if inline_module_args() else None,
+            )
+            v_proj_kv_states = self.v_proj(key_value_states)
+            value_states = self._shape(
+                v_proj_kv_states,
+                -1,
+                bsz,
+                # <bojian/Grape>
+                (3 + G_DECODER_LAYER_IDX * 4 + 3) if inline_module_args() else None,
+            )
+
         elif past_key_value is not None:
             # reuse k, v, self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+            # <bojian/Grape>
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            # seq_len = past_key_value[0].shape[2] + key_states.numel() // bsz // self.num_heads // self.head_dim
+            # if inline_module_args() and (seq_len,) in G_CUDA_GRAPH_MODULE_ARGS_CACHE:
+            #     dst_module_arg = G_CUDA_GRAPH_MODULE_ARGS_CACHE[(seq_len,)][3 + G_DECODER_LAYER_IDX * 4]
+            #     dst_module_arg[:, :, :, :] = torch.cat([past_key_value[0], key_states], dim=2)
+            #     key_states = dst_module_arg
+            #     dst_module_arg = G_CUDA_GRAPH_MODULE_ARGS_CACHE[(seq_len,)][3 + G_DECODER_LAYER_IDX * 4 + 1]
+            #     dst_module_arg[:, :, :, :] = torch.cat([past_key_value[1], value_states], dim=2)
+            #     value_states = dst_module_arg
+            # else:
+            #     if inline_module_args():
+            #         print(
+            #             f"Unable to inline the past_key_values because seq_len={seq_len}"
+            #             " does not yet exist in G_CUDA_GRAPH_MODULE_ARGS_CACHE"
+            #         )
+            #     key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            #     value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
         else:
             # self_attention
+
+            # <bojian/Grape>
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            # key_states = self._shape(
+            #     self.k_proj(hidden_states),
+            #     -1,
+            #     bsz,
+            #     (3 + G_DECODER_LAYER_IDX * 4) if inline_module_args() else None,
+            # )
+            # value_states = self._shape(
+            #     self.v_proj(hidden_states),
+            #     -1,
+            #     bsz,
+            #     (3 + G_DECODER_LAYER_IDX * 4 + 1) if inline_module_args() else None,
+            # )
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -1044,6 +1134,13 @@ class PegasusDecoder(PegasusPreTrainedModel):
                     len(self.layers)
                 ), f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
         for idx, decoder_layer in enumerate(self.layers):
+            # <bojian/Grape>
+            if inline_module_args():
+                global G_DECODER_LAYER_IDX
+                G_DECODER_LAYER_IDX = idx
+
+            # os.environ["DEBUG_LAYER_IDX"] = f"{idx}"
+
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1054,7 +1151,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
                     logger.warning(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -1079,7 +1175,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
                     None,
                 )
             else:
-
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1463,11 +1558,34 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
     @staticmethod
     def _reorder_cache(past, beam_idx):
         reordered_past = ()
-        for layer_past in past:
-            # cached cross_attention states don't have to be reordered -> they are always the same
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
-            )
+
+        # <bojian/Grape>
+        # for layer_past in past:
+        #     # cached cross_attention states don't have to be reordered -> they are always the same
+        #     reordered_past += (
+        #         tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+        #     )
+        if int(os.getenv("DECODER_COMPILED_WITH_MODULE_ARGS_INLINED", "0")):
+            seq_len = past[0][0].shape[2]
+            for layer_idx, layer_past in enumerate(past):
+                dst_module_args = G_CUDA_GRAPH_MODULE_ARGS_CACHE[(seq_len,)]
+                torch.index_select(layer_past[0], 0, beam_idx, out=dst_module_args[3 + layer_idx * 4])
+                torch.index_select(layer_past[1], 0, beam_idx, out=dst_module_args[3 + layer_idx * 4 + 1])
+                reordered_past += (
+                    (
+                        dst_module_args[3 + layer_idx * 4],
+                        dst_module_args[3 + layer_idx * 4 + 1],
+                        layer_past[2],
+                        layer_past[3],
+                    ),
+                )
+        else:
+            for layer_past in past:
+                # cached cross_attention states don't have to be reordered -> they are always the same
+                reordered_past += (
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+                )
+
         return reordered_past
 
 

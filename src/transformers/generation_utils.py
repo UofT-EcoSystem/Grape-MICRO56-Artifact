@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import inspect
 import warnings
 from dataclasses import dataclass
@@ -23,8 +24,38 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+# <bojian/Grape> Add NVTX markers.
+from contextlib import nullcontext
+
+from quik_fix import nsys, GPUTimer, CSVStatsLogger, positive, negative
+
+try:
+    from torch.cuda.graphs_ext import MempoolType, make_dynamic_graphed_callable, GRAPE_MODULE_CCACHE
+except ImportError:
+    print(f"[W] {__file__} skips the import of graphs_ext")
+
+CONFIG_POST_PROCESS_OUTPUTS = False
+CONFIG_PROFILE_ONE_DECODING_ITER = False
+CONFIG_PROFILE_ACCUMULATIVELY = False
+CONFIG_GRAPH_BEAM_SEARCH = False
+CONFIG_USE_GRAPHED_BEAM_SEARCH = True
+CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH = 128
+CONFIG_GRAPH_REORDER_CACHE = False
+# CONFIG_FWD_TO_PLACEHOLDERS = False
+CONFIG_VERIFY_GRAPHED_BEAM_SEARCH = False
+G_CSV_LOGGER = None
+G_GPU_TIMER_MAIN_LOOP = nullcontext()
+
+# </bojian/Grape>
+
+
 from .generation_beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
-from .generation_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+from .generation_beam_search import (
+    BeamScorer,
+    BeamSearchScorer,
+    ConstrainedBeamSearchScorer,
+    BeamSearchPostProcessModule,  # <bojian/Grape>
+)
 from .generation_logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     ExponentialDecayLengthPenalty,
@@ -532,7 +563,6 @@ class GenerationMixin:
         bos_token_id: int = None,
         model_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.LongTensor:
-
         if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
             return model_kwargs.pop("decoder_input_ids")
         else:
@@ -589,9 +619,24 @@ class GenerationMixin:
         if is_encoder_decoder:
             if encoder_outputs is None:
                 raise ValueError("If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.")
+
+            # <bojian/Grape> Inline the decoder's module arguments.
+            # encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+            #     0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            # )
+            # if int(os.getenv("DECODER_COMPILED_WITH_MODULE_ARGS_INLINED", "0")):
+            #     dst_module_arg = G_CUDA_GRAPH_MODULE_ARGS_CACHE[(1,)][1]
+            #     torch.index_select(
+            #         encoder_outputs.last_hidden_state,
+            #         0,
+            #         expanded_return_idx.to(encoder_outputs.last_hidden_state.device),
+            #         out=dst_module_arg,
+            #     )
+            #     encoder_outputs["last_hidden_state"] = dst_module_arg
             encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
                 0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
             )
+
             model_kwargs["encoder_outputs"] = encoder_outputs
         return input_ids, model_kwargs
 
@@ -1306,6 +1351,7 @@ class GenerationMixin:
                 length_penalty=length_penalty,
                 do_early_stopping=early_stopping,
                 num_beam_hyps_to_keep=num_return_sequences,
+                max_generate_length=max_length,  # <bojian/Grape>
             )
             # 11. interleave input_ids with `num_beams` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -1340,6 +1386,7 @@ class GenerationMixin:
                 device=self.device,
                 length_penalty=length_penalty,
                 do_early_stopping=early_stopping,
+                max_generate_length=max_length,  # <bojian/Grape>
             )
 
             # 12. interleave input_ids with `num_beams` additional sequences per batch
@@ -1385,6 +1432,7 @@ class GenerationMixin:
                 do_early_stopping=early_stopping,
                 num_beam_hyps_to_keep=num_return_sequences,
                 num_beam_groups=num_beam_groups,
+                max_generate_length=max_length,  # <bojian/Grape>
             )
             # 11. interleave input_ids with `num_beams` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -1484,6 +1532,26 @@ class GenerationMixin:
                 synced_gpus=synced_gpus,
                 **model_kwargs,
             )
+
+    # <bojian/Grape> Add the post-processing for outputs.
+    def _post_process_outputs(self, outputs):
+        from collections import namedtuple
+        from .modeling_outputs import CausalLMOutputWithCrossAttentions
+
+        if isinstance(outputs, dict):
+            OutputsNamedTuple = namedtuple("OutputsNamedTuple", outputs)
+            return OutputsNamedTuple(**outputs)
+            # for k, v in outputs.items():
+            #     ret[k] = v
+            # return ret
+        elif isinstance(outputs, tuple):  # TensorRT
+            # OutputsNamedTuple = namedtuple("OutputsNamedTuple", ['logits', 'past_key_values'])
+            # return OutputsNamedTuple(*outputs)
+            return CausalLMOutputWithCrossAttentions(logits=outputs[0], past_key_values=outputs[1])
+        raise NotImplementedError(f"outputs of type={type(outputs)} has not been handled")
+
+    # <bojian/Grape>
+    # @nvtx.annotate("greedy_search")
 
     def greedy_search(
         self,
@@ -1619,8 +1687,12 @@ class GenerationMixin:
         cur_len = input_ids.shape[-1]
 
         this_peer_finished = False  # used by synced_gpus only
-        while True:
 
+        # <bojian/Grape>
+        # loop_body_nvtx_marker = nvtx.annotate("generate_LoopBody")
+        # search_marker = nvtx.annotate("Search")
+
+        while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -1631,22 +1703,40 @@ class GenerationMixin:
                 if this_peer_finished_flag.item() == 0.0:
                     break
 
+            # <bojian/Grape>
+            # loop_body_nvtx_marker.__enter__()
+
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            # forward pass to get next token
-            outputs = self(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
+            # <bojian/Grape>
+            # print(model_inputs['input_ids'].shape, model_inputs['attention_mask'])
+
+            # <bojian/Grape> Add the NVTX marker.
+            # with nvtx.annotate("Forward"):
+            if True:
+                # forward pass to get next token
+                outputs = self(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+
+            # <bojian/Grape> Add post-processing for outputs.
+            # if CONFIG_POST_PROCESS_OUTPUTS:
+            #     outputs = self._post_process_outputs(outputs)
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
                 continue  # don't waste resources running the code we don't need
 
-            next_token_logits = outputs.logits[:, -1, :]
+            # <bojian/Grape> Get the logits by the original input_ids length.
+            # next_token_logits = outputs.logits[:, -1, :]
+            if outputs.logits.shape[1] != 1:
+                next_token_logits = outputs.logits[:, input_ids.shape[1] - 1, :]
+            else:
+                next_token_logits = outputs.logits[:, -1, :]
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -1685,9 +1775,16 @@ class GenerationMixin:
             )
             cur_len = cur_len + 1
 
+            # <bojian/Grape>
+            # print(eos_token_id)
+
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id is not None:
                 unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+
+            # <bojian/Grape>
+            # print(unfinished_sequences)
+            # loop_body_nvtx_marker.__exit__(None, None, None)
 
             # stop when each sentence is finished, or if we exceed the maximum length
             if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
@@ -1874,7 +1971,6 @@ class GenerationMixin:
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
         while True:
-
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -1895,6 +1991,10 @@ class GenerationMixin:
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
+
+            # <bojian/Grape> !!!Important Add post-processing for outputs.
+            # if CONFIG_POST_PROCESS_OUTPUTS:
+            #     outputs = self._post_process_outputs(outputs)
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
@@ -1972,6 +2072,9 @@ class GenerationMixin:
                 )
         else:
             return input_ids
+
+    # <bojian/Grape>
+    # @nsys.AnnotateEX("beam_search")
 
     def beam_search(
         self,
@@ -2141,8 +2244,87 @@ class GenerationMixin:
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
         this_peer_finished = False  # used by synced_gpus only
-        while True:
 
+        # <bojian/Grape>
+        loop_body_nvtx_marker = nsys.AnnotateEX("generate_LoopBody")
+
+        if CONFIG_GRAPH_BEAM_SEARCH:
+            model_params = list(self.parameters())
+            float_dtype = model_params[0].dtype
+            beam_search_post_processor = BeamSearchPostProcessModule(
+                batch_size=batch_size,
+                num_beams=num_beams,
+                num_beam_groups=beam_scorer.num_beam_groups,
+                max_generate_length=beam_scorer.max_generate_length,
+                length_penalty=beam_scorer.length_penalty,
+                early_stopping=beam_scorer.do_early_stopping,
+                logits_processor=logits_processor,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                generation_module=self,
+            ).eval()
+
+            def _beam_search_args_generator(seq_len):
+                return (
+                    torch.zeros(num_beams, seq_len, dtype=torch.int64, device="cuda"),
+                    torch.zeros(num_beams, self.config.vocab_size, dtype=float_dtype, device="cuda"),
+                    torch.tensor(1, device="cuda"),
+                )  # + (
+                #     (
+                #         torch.zeros(
+                #             num_beams,
+                #             self.config.n_head,
+                #             seq_len,
+                #             self.config.n_embd // self.config.n_head,
+                #             dtype=float_dtype,
+                #             device="cuda",
+                #         ),
+                #     )
+                #     if CONFIG_GRAPH_REORDER_CACHE
+                #     else tuple()
+                # )
+
+            graphed_beam_search_post_processor = make_dynamic_graphed_callable(
+                modules=beam_search_post_processor,
+                module_args_generator=_beam_search_args_generator,
+                module_args_generator_args_list=list(
+                    range(
+                        (cur_len + CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH - 1)
+                        // (CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH)
+                        * CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH,
+                        beam_scorer.max_generate_length,
+                        CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH,
+                    )
+                )
+                + [
+                    beam_scorer.max_generate_length - 1,
+                ],
+                num_total_warmup_iters=1,
+                mempool_type=MempoolType.TAPE,
+                has_subgraph=True,
+                compress_metadata=False,
+            )
+            gpu_timer_graphed_beam_search = (
+                GPUTimer("GraphedBeamSearch") if CONFIG_VERIFY_GRAPHED_BEAM_SEARCH else nullcontext()
+            )
+
+        if CONFIG_PROFILE_ONE_DECODING_ITER:
+            csv_logger = CSVStatsLogger("speedometer.csv")
+            gpu_timer_inputprep = GPUTimer("InputPrep", csv_logger)
+            gpu_timer_model = GPUTimer("Model", csv_logger)
+            gpu_timer_beam_search = GPUTimer("BeamSearch", csv_logger)
+
+        if CONFIG_PROFILE_ACCUMULATIVELY:
+            input_prep_acc_time = 0.0
+            model_acc_time = 0.0
+            beam_search_acc_time = 0.0
+            import time
+
+        # <bojian/Grape>
+        G_GPU_TIMER_MAIN_LOOP.__enter__()
+        # from quik_fix import nvml
+
+        while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -2153,20 +2335,147 @@ class GenerationMixin:
                 if this_peer_finished_flag.item() == 0.0:
                     break
 
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            # <bojian/Grape> Add the NVTX marker.
+            loop_body_nvtx_marker.__enter__()
 
-            outputs = self(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
+            # <bojian/Grape> Add the NVTX marker.
+            # model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if CONFIG_PROFILE_ONE_DECODING_ITER:
+                gpu_timer_inputprep.__enter__()
+            if CONFIG_PROFILE_ACCUMULATIVELY:
+                torch.cuda.synchronize()
+                tic = time.perf_counter()
+            with nsys.AnnotateEX("prepare_inputs"):
+                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if CONFIG_PROFILE_ONE_DECODING_ITER:
+                gpu_timer_inputprep.__exit__(None, None, None)
+            if CONFIG_PROFILE_ACCUMULATIVELY:
+                torch.cuda.synchronize()
+                input_prep_acc_time += time.perf_counter() - tic
+
+            # os.environ["DEBUG_CUR_LEN"] = f"{cur_len}")
+
+            # <bojian/Grape> Add the NVTX marker.
+            # outputs = self(
+            #     **model_inputs,
+            #     return_dict=True,
+            #     output_attentions=output_attentions,
+            #     output_hidden_states=output_hidden_states,
+            # )
+            if CONFIG_PROFILE_ONE_DECODING_ITER:
+                gpu_timer_model.__enter__()
+            if CONFIG_PROFILE_ACCUMULATIVELY:
+                torch.cuda.synchronize()
+                tic = time.perf_counter()
+            with nsys.AnnotateEX("Forward"):
+                outputs = self(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+            if CONFIG_PROFILE_ONE_DECODING_ITER:
+                gpu_timer_model.__exit__(None, None, None)
+            if CONFIG_PROFILE_ACCUMULATIVELY:
+                torch.cuda.synchronize()
+                model_acc_time += time.perf_counter() - tic
+            # </bojian/Grape>
+
+            # <bojian/Grape> Post-process for outputs (needed by TensorRT).
+            if CONFIG_POST_PROCESS_OUTPUTS:
+                outputs = self._post_process_outputs(outputs)
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
                 continue  # don't waste resources running the code we don't need
 
-            next_token_logits = outputs.logits[:, -1, :]
+            # <bojian/Grape>
+            if CONFIG_GRAPH_BEAM_SEARCH and CONFIG_USE_GRAPHED_BEAM_SEARCH:
+                if CONFIG_PROFILE_ONE_DECODING_ITER:
+                    gpu_timer_beam_search.__enter__()
+                if CONFIG_PROFILE_ACCUMULATIVELY:
+                    torch.cuda.synchronize()
+                    tic = time.perf_counter()
+                cur_len_padded = (
+                    (cur_len + CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH - 1)
+                    // CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH
+                    * CONFIG_GRAPH_BEAM_SEARCH_BUCKET_WIDTH
+                )
+                if cur_len_padded >= beam_scorer.max_generate_length:
+                    cur_len_padded = beam_scorer.max_generate_length - 1
+
+                graphed_beam_search_post_processor.configure(cur_len_padded)
+                (
+                    # new_input_ids,
+                    new_beam_next_tokens,
+                    new_beam_idx,
+                    new_next_tokens,
+                    new_next_indices,
+                    # reordered_past_key_values,
+                ) = graphed_beam_search_post_processor(
+                    torch.nn.functional.pad(input_ids, (0, cur_len_padded - cur_len), mode="constant", value=0)
+                    if cur_len_padded != cur_len
+                    else input_ids,
+                    outputs.logits[:, -1, :],
+                    torch.tensor(cur_len, device="cuda")
+                    # , outputs.past_key_values if CONFIG_GRAPH_REORDER_CACHE else None
+                )
+                new_input_ids = torch.cat([input_ids[new_beam_idx, :], new_beam_next_tokens.unsqueeze(-1)], dim=-1)
+
+                if not CONFIG_VERIFY_GRAPHED_BEAM_SEARCH:
+                    input_ids = new_input_ids
+                    beam_scores = beam_search_post_processor.beam_scores
+                    beam_next_tokens = new_beam_next_tokens
+                    beam_idx = new_beam_idx
+                    next_tokens = new_next_tokens
+                    next_indices = new_next_indices
+                    model_kwargs = self._update_model_kwargs_for_generation(
+                        outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+                    )
+                    if model_kwargs["past"] is not None:
+                        # if CONFIG_FWD_TO_PLACEHOLDERS:
+                        #     torch._C.fwdToCUDAGraphPlaceholdersBegin(
+                        #         [
+                        #             t.data_ptr()
+                        #             for t in self.graphed_autoregressive_model.fwd_graph_flattened_inputs_placeholders[
+                        #                 0
+                        #             ][0][3:]
+                        #         ]
+                        #     )
+                        model_kwargs["past"] = self._reorder_cache(model_kwargs["past"], beam_idx)
+                        # if CONFIG_FWD_TO_PLACEHOLDERS:
+                        #     torch._C.fwdToCUDAGraphPlaceholdersEnd()
+                    # increase cur_len
+                    cur_len = cur_len + 1
+                    loop_body_nvtx_marker.__exit__(None, None, None)
+                    if beam_search_post_processor.done or stopping_criteria(input_ids, scores):
+                        break
+
+                    if CONFIG_PROFILE_ONE_DECODING_ITER:
+                        gpu_timer_beam_search.__exit__(None, None, None)
+                    if CONFIG_PROFILE_ACCUMULATIVELY:
+                        torch.cuda.synchronize()
+                        beam_search_acc_time += time.perf_counter() - tic
+                    else:
+                        torch.cuda.synchronize()
+
+                    continue
+            # if CONFIG_GRAPH_BEAM_SEARCH:
+
+            if CONFIG_PROFILE_ONE_DECODING_ITER:
+                gpu_timer_beam_search.__enter__()
+            if CONFIG_PROFILE_ACCUMULATIVELY:
+                torch.cuda.synchronize()
+                tic = time.perf_counter()
+            # </bojian/Grape>
+
+            # <bojian/Grape> Get the logits by the original input_ids length.
+            # next_token_logits = outputs.logits[:, -1, :]
+            if outputs.logits.shape[1] != 1:
+                next_token_logits = outputs.logits[:, input_ids.shape[1] - 1, :]
+            else:
+                next_token_logits = outputs.logits[:, -1, :]
+
             # hack: adjust tokens for Marian. For Marian we have to make sure that the `pad_token_id`
             # cannot be generated both before and after the `nn.functional.log_softmax` operation.
             next_token_logits = self.adjust_logits_during_generation(next_token_logits, cur_len=cur_len)
@@ -2206,15 +2515,16 @@ class GenerationMixin:
             next_indices = torch_int_div(next_tokens, vocab_size)
             next_tokens = next_tokens % vocab_size
 
-            # stateless
-            beam_outputs = beam_scorer.process(
-                input_ids,
-                next_token_scores,
-                next_tokens,
-                next_indices,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-            )
+            with nsys.AnnotateEX("BeamScorer"):
+                # stateless
+                beam_outputs = beam_scorer.process(
+                    input_ids,
+                    next_token_scores,
+                    next_tokens,
+                    next_indices,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=eos_token_id,
+                )
 
             beam_scores = beam_outputs["next_beam_scores"]
             beam_next_tokens = beam_outputs["next_beam_tokens"]
@@ -2226,7 +2536,78 @@ class GenerationMixin:
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
             if model_kwargs["past"] is not None:
+                # if CONFIG_FWD_TO_PLACEHOLDERS:
+                #     torch._C.fwdToCUDAGraphPlaceholdersBegin(
+                #         [
+                #             t.data_ptr()
+                #             for t in self.graphed_autoregressive_model.fwd_graph_flattened_inputs_placeholders[0][0][
+                #                 3:
+                #             ]
+                #         ]
+                #     )
                 model_kwargs["past"] = self._reorder_cache(model_kwargs["past"], beam_idx)
+                # if CONFIG_FWD_TO_PLACEHOLDERS:
+                #     torch._C.fwdToCUDAGraphPlaceholdersEnd()
+
+            # <bojian/Grape>
+            if CONFIG_PROFILE_ONE_DECODING_ITER:
+                gpu_timer_beam_search.__exit__(None, None, None)
+            if CONFIG_PROFILE_ACCUMULATIVELY:
+                torch.cuda.synchronize()
+                beam_search_acc_time += time.perf_counter() - tic
+
+            if CONFIG_VERIFY_GRAPHED_BEAM_SEARCH:
+                assert torch.allclose(input_ids, new_input_ids)
+                assert torch.allclose(beam_scores, beam_search_post_processor.beam_scores)
+                assert torch.allclose(beam_next_tokens, new_beam_next_tokens)
+                assert torch.allclose(beam_idx, new_beam_idx)
+                assert torch.allclose(beam_scorer._done, beam_search_post_processor.done)
+
+                # For debugging
+                # print(
+                #     beam_search_post_processor.beam_hyps[0].worst_score,
+                #     beam_search_post_processor.beam_hyps[0].scoreboard,
+                #     beam_search_post_processor.global_inds_copy[:, :8],
+                # )
+
+                assert torch.allclose(
+                    torch.tensor(beam_scorer._beam_hyps[0].worst_score, device="cuda"),
+                    beam_search_post_processor.beam_hyps[0].worst_score,
+                ), f"{beam_scorer._beam_hyps[0].worst_score} != {beam_search_post_processor.beam_hyps[0].worst_score}"
+
+                if beam_scorer._beam_hyps[0].beams:
+                    sorted_scoreboard = sorted(
+                        beam_scorer._beam_hyps[0].beams, key=lambda score_item_pair: score_item_pair[0]
+                    )
+                    sorted_scores = torch.tensor([item[0] for item in sorted_scoreboard], device="cuda")
+                    if beam_search_post_processor.beam_hyps[0].scoreboard[-1] == 1e9:
+                        assert torch.allclose(
+                            sorted_scores,
+                            beam_search_post_processor.beam_hyps[0].scoreboard[: len(beam_scorer._beam_hyps[0].beams)],
+                            atol=1e-3,
+                            rtol=1e-3,
+                        )
+                        for beam_scorer_beam_i, _ in enumerate(beam_scorer._beam_hyps[0].beams):
+                            assert torch.allclose(
+                                sorted_scoreboard[beam_scorer_beam_i][1],
+                                beam_search_post_processor.beam_hyps[0].scoreboard_items[beam_scorer_beam_i][
+                                    : sorted_scoreboard[beam_scorer_beam_i][1].shape[0]
+                                ],
+                            )
+                    else:
+                        assert torch.allclose(
+                            sorted_scores,
+                            beam_search_post_processor.beam_hyps[0].scoreboard[1:],
+                        )
+                        for beam_scorer_beam_i, _ in enumerate(beam_scorer._beam_hyps[0].beams):
+                            assert torch.allclose(
+                                sorted_scoreboard[beam_scorer_beam_i][1],
+                                beam_search_post_processor.beam_hyps[0].scoreboard_items[1 + beam_scorer_beam_i][
+                                    : sorted_scoreboard[beam_scorer_beam_i][1].shape[0]
+                                ],
+                            )
+            # if CONFIG_VERIFY_GRAPHED_BEAM_SEARCH
+            # </bojian/Grape>
 
             if return_dict_in_generate and output_scores:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
@@ -2234,11 +2615,21 @@ class GenerationMixin:
             # increase cur_len
             cur_len = cur_len + 1
 
+            # <bojian/Grape>
+            loop_body_nvtx_marker.__exit__(None, None, None)
+
             if beam_scorer.is_done or stopping_criteria(input_ids, scores):
                 if not synced_gpus:
                     break
                 else:
                     this_peer_finished = True
+
+        # <bojian/Grape>
+        G_GPU_TIMER_MAIN_LOOP.__exit__(None, None, None)
+        if G_CSV_LOGGER is not None:
+            G_CSV_LOGGER.write("InputPrep", input_prep_acc_time)
+            G_CSV_LOGGER.write("Model", model_acc_time)
+            G_CSV_LOGGER.write("BeamSearch", beam_search_acc_time)
 
         sequence_outputs = beam_scorer.finalize(
             input_ids,
@@ -2459,7 +2850,6 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
         while True:
-
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -2482,6 +2872,10 @@ class GenerationMixin:
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
                 continue  # don't waste resources running the code we don't need
+
+            # <bojian/Grape> !!!Important Add post-processing for outputs.
+            # if CONFIG_POST_PROCESS_OUTPUTS:
+            #     outputs = self._post_process_outputs(outputs)
 
             next_token_logits = outputs.logits[:, -1, :]
 
@@ -2787,7 +3181,6 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
         while True:
-
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -2988,7 +3381,6 @@ class GenerationMixin:
         synced_gpus: Optional[bool] = None,
         **model_kwargs,
     ) -> Union[BeamSearchOutput, torch.LongTensor]:
-
         r"""
         Generates sequences of token ids for models with a language modeling head using **constrained beam search
         decoding** and can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
@@ -3149,7 +3541,6 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
         while True:
-
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence

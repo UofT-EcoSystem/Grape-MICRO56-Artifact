@@ -61,6 +61,9 @@ from .configuration_gpt2 import GPT2Config
 
 logger = logging.get_logger(__name__)
 
+# <bojian/Grape>
+# from quik_fix import nvml
+
 _CHECKPOINT_FOR_DOC = "gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
 _TOKENIZER_FOR_DOC = "GPT2Tokenizer"
@@ -321,12 +324,28 @@ class GPT2Attention(nn.Module):
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
         if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+            # <bojian/Grape>
+            # past_key, past_value = layer_past
+            # key = torch.cat((past_key, key), dim=-2)
+            # value = torch.cat((past_value, value), dim=-2)
+            if isinstance(layer_past, tuple):
+                past_key, past_value = layer_past
+                key = torch.cat((past_key, key), dim=-2)
+                value = torch.cat((past_value, value), dim=-2)
+            else:
+                key = torch.cat((layer_past[0, :, :, :, :], key), dim=-2)
+                value = torch.cat((layer_past[1, :, :, :, :], value), dim=-2)
 
+        # <bojian/Grape>
+        # if use_cache is True:
+        #     present = (key, value)
         if use_cache is True:
-            present = (key, value)
+            if isinstance(layer_past, tuple):
+                present = (key, value)
+            else:
+                # Stack the key and value into a single tensor.
+                present = torch.stack([key, value], dim=0)
+
         else:
             present = None
 
@@ -756,6 +775,8 @@ class GPT2Model(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        # <bojian/Grape>
+        stack_past_key_values=False,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -846,57 +867,95 @@ class GPT2Model(GPT2PreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+
+        # <bojian/Grape>
+        # if stack_past_key_values:
+        #     layer_pasts_tuple = enumerate(self.h)
+        # else:
+        #     layer_pasts_tuple = enumerate(zip(self.h, past_key_values))
+        # for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        # for i, layer_past_tuple in layer_pasts_tuple:
+        for i, block in enumerate(self.h):
+            # <bojian/Grape>
+            if stack_past_key_values:
+                if isinstance(past_key_values, tuple):
+                    assert past_key_values[i] is None
+                    layer_past = past_key_values[i]
+                else:
+                    layer_past = past_key_values[i, :, :, :, :, :]
+            else:
+                layer_past = past_key_values[i]
+
+            # <bojian/Grape> Comment out model parallelism since we are not
+            # using it and it prevents scripting.
 
             # Model parallel
-            if self.model_parallel:
-                torch.cuda.set_device(hidden_states.device)
-                # Ensure layer_past is on same device as hidden_states (might not be correct)
-                if layer_past is not None:
-                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
-                # Ensure that attention_mask is always on the same device as hidden_states
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(hidden_states.device)
-                if isinstance(head_mask, torch.Tensor):
-                    head_mask = head_mask.to(hidden_states.device)
+            # if self.model_parallel:
+            #     torch.cuda.set_device(hidden_states.device)
+            #     # Ensure layer_past is on same device as hidden_states (might not be correct)
+            #     if layer_past is not None:
+            #         layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
+            #     # Ensure that attention_mask is always on the same device as hidden_states
+            #     if attention_mask is not None:
+            #         attention_mask = attention_mask.to(hidden_states.device)
+            #     if isinstance(head_mask, torch.Tensor):
+            #         head_mask = head_mask.to(hidden_states.device)
+
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            # <bojian/Grape> Comment out gradient checkpointing since we are not
+            # enabling it and it prevents scripting.
 
-                if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                    )
-                    use_cache = False
+            # if self.gradient_checkpointing and self.training:
 
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, use_cache, output_attentions)
+            #     if use_cache:
+            #         logger.warning(
+            #             "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+            #         )
+            #         use_cache = False
 
-                    return custom_forward
+            #     def create_custom_forward(module):
+            #         def custom_forward(*inputs):
+            #             # None for past_key_value
+            #             return module(*inputs, use_cache, output_attentions)
 
-                outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    None,
-                    attention_mask,
-                    head_mask[i],
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                )
-            else:
-                outputs = block(
-                    hidden_states,
-                    layer_past=layer_past,
-                    attention_mask=attention_mask,
-                    head_mask=head_mask[i],
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                )
+            #         return custom_forward
+
+            #     outputs = torch.utils.checkpoint.checkpoint(
+            #         create_custom_forward(block),
+            #         hidden_states,
+            #         None,
+            #         attention_mask,
+            #         head_mask[i],
+            #         encoder_hidden_states,
+            #         encoder_attention_mask,
+            #     )
+            # else:
+
+            #     # <bojian/Grape>
+            #     # print(block)
+
+            #     outputs = block(
+            #         hidden_states,
+            #         layer_past=layer_past,
+            #         attention_mask=attention_mask,
+            #         head_mask=head_mask[i],
+            #         encoder_hidden_states=encoder_hidden_states,
+            #         encoder_attention_mask=encoder_attention_mask,
+            #         use_cache=use_cache,
+            #         output_attentions=output_attentions,
+            #     )
+            outputs = block(
+                hidden_states,
+                layer_past=layer_past,
+                attention_mask=attention_mask,
+                head_mask=head_mask[i],
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
 
             hidden_states = outputs[0]
             if use_cache is True:
@@ -913,6 +972,10 @@ class GPT2Model(GPT2PreTrainedModel):
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
+        # <bojian/Grape>
+        if use_cache is True and stack_past_key_values:
+            presents = torch.stack(presents, dim=0)
+
         hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(output_shape)
@@ -920,12 +983,14 @@ class GPT2Model(GPT2PreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
-                if v is not None
-            )
+        # <bojian/Grape> Commented out since we are training using
+        # if not return_dict:
+        #     return tuple(
+        #         v
+        #         for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+        #         if v is not None
+        #     )
+        # print(type(presents[0][0]))
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -1003,7 +1068,17 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
-        return {
+
+        # <bojian/Grape>
+        # return {
+        #     "input_ids": input_ids,
+        #     "past_key_values": past,
+        #     "use_cache": kwargs.get("use_cache"),
+        #     "position_ids": position_ids,
+        #     "attention_mask": attention_mask,
+        #     "token_type_ids": token_type_ids,
+        # }
+        ret = {
             "input_ids": input_ids,
             "past_key_values": past,
             "use_cache": kwargs.get("use_cache"),
@@ -1011,6 +1086,23 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids,
         }
+        # def _unwrap_shape(item):
+        #     if item is None:
+        #         return None
+        #     if hasattr(item, "shape"):
+        #         return (item.shape, item.dtype)
+        #     try:
+        #         ret = [None] * len(item)
+        #         for i, subitem in enumerate(item):
+        #             ret[i] = _unwrap_shape(subitem)
+        #         return ret
+        #     except Exception: # pylint: disable=broad-except
+        #         return None
+
+        # print({k : _unwrap_shape(v) for k, v in ret.items()})
+        # print("input_ids", input_ids)
+
+        return ret
 
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -1022,10 +1114,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids=None,
+        # <bojian/Grape> Reorder the arguments so that common ones appear first.
         past_key_values=None,
         attention_mask=None,
         token_type_ids=None,
         position_ids=None,
+        # position_ids=None,
+        # attention_mask=None,
+        # past_key_values=None,
+        # token_type_ids=None,
         head_mask=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
@@ -1035,7 +1132,14 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        # <bojian/Grape> Whether to return a stacked version of past key-value pairs.
+        stack_past_key_values=False,
     ):
+        # # <bojian/Grape>
+        # if past_key_values is not None:
+        #     print("model inputs: ", input_ids, position_ids, attention_mask)
+        #     print("past_key_values: ", past_key_values[0][0][:, :, -1, :])
+
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
@@ -1043,6 +1147,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # <bojian/Grape>
+        # print(input_ids.shape, use_cache)
 
         transformer_outputs = self.transformer(
             input_ids,
@@ -1058,6 +1165,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            # <bojian/Grape>
+            stack_past_key_values=stack_past_key_values,
         )
         hidden_states = transformer_outputs[0]
 
@@ -1066,7 +1175,13 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
+        # <bojian/Grape>
+        # print(nvml.query_gpu_status(nvml.GPUQueryKind.MEMORY))
+
         lm_logits = self.lm_head(hidden_states)
+
+        # <bojian/Grape>
+        # print(nvml.query_gpu_status(nvml.GPUQueryKind.MEMORY))
 
         loss = None
         if labels is not None:
@@ -1081,6 +1196,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
+        # <bojian/Grape> Only returning the logits and the past_key_values
+        #                 since only those are needed in the backward pass.
+        # print(type(transformer_outputs))
+
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
@@ -1090,6 +1209,17 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             cross_attentions=transformer_outputs.cross_attentions,
         )
 
+        # print("lm_logits: ", lm_logits)
+        # if past_key_values is not None:
+        #     print("lm_logits: ", lm_logits)
+        #     assert False
+
+        # return loss, lm_logits, transformer_outputs.past_key_values, \
+        #        transformer_outputs.hidden_states, \
+        #        transformer_outputs.attentions, \
+        #        transformer_outputs.cross_attentions
+        # return lm_logits, transformer_outputs.past_key_values
+
     @staticmethod
     def _reorder_cache(past: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
         """
@@ -1097,6 +1227,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
         beam_idx at every generation step.
         """
+
+        # <bojian/Grape>
+        assert not isinstance(past, torch.Tensor), "Please disable stack_past_key_values in the default module"
+
         return tuple(
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
             for layer_past in past

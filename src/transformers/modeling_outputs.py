@@ -44,6 +44,8 @@ class BaseModelOutput(ModelOutput):
     last_hidden_state: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    # <bojian/Grape> For debugging intermediate tensor values in graphed executions.
+    tensor_to_debug: Optional[torch.FloatTensor] = None
 
 
 @dataclass

@@ -21,6 +21,26 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
+# <bojian/Grape>
+from contextlib import nullcontext
+
+try:
+    from torch._C import BeamHypotheses_copyDataPtr
+    from torch.cuda.graphs_ext import (  # pylint: disable=unused-import
+        GrapeRewriterCtx,
+        GrapeSkipBlock,
+        GrapeForceNoInlineCtx,
+        G_GRAPE_GLOBAL_INDICATOR_STACK,
+        # The constant-true indicator is for debugging.
+        G_GRAPE_CONST_TRUE_GLOBAL_INDICATOR_CTX,
+        GRAPE_MODULE_CCACHE,
+    )
+except ImportError:
+    print(f"[W] {__file__} skips the import of graphs_ext")
+from quik_fix import nsys
+
+# </bojian/Grape>
+
 from .generation_beam_constraints import Constraint, ConstraintListState
 from .utils import add_start_docstrings
 
@@ -160,6 +180,7 @@ class BeamSearchScorer(BeamScorer):
         do_early_stopping: Optional[bool] = False,
         num_beam_hyps_to_keep: Optional[int] = 1,
         num_beam_groups: Optional[int] = 1,
+        max_generate_length=128,  # <bojian/Grape>
         **kwargs,
     ):
         self.num_beams = num_beams
@@ -169,6 +190,7 @@ class BeamSearchScorer(BeamScorer):
         self.num_beam_hyps_to_keep = num_beam_hyps_to_keep
         self.num_beam_groups = num_beam_groups
         self.group_size = self.num_beams // self.num_beam_groups
+        self.max_generate_length = max_generate_length  # <bojian/Grape>
 
         self._is_init = False
         self._beam_hyps = [
@@ -176,6 +198,10 @@ class BeamSearchScorer(BeamScorer):
                 num_beams=self.num_beams,
                 length_penalty=self.length_penalty,
                 early_stopping=self.do_early_stopping,
+                # <bojian/Grape>
+                batch_size=batch_size,
+                max_generate_length=max_generate_length,
+                # </bojian/Grape>
             )
             for _ in range(batch_size)
         ]
@@ -198,6 +224,15 @@ class BeamSearchScorer(BeamScorer):
                 "`max_length` should be passed directly to `beam_search(...)`, `beam_sample(...)`"
                 ", or `group_beam_search(...)`."
             )
+
+        # <bojian/Grape>
+        self._0 = torch.tensor(0, device="cuda")
+        self._1 = torch.tensor(1, device="cuda")
+        self._group_size = torch.tensor(self.group_size, device="cuda")
+        self._true = torch.tensor(True, device="cuda")
+        self._false = torch.tensor(False, device="cuda")
+        self._beam_array = torch.arange(0, 2 * num_beams, device="cuda")
+        # </bojian/Grape>
 
     @property
     def is_done(self) -> bool:
@@ -280,6 +315,57 @@ class BeamSearchScorer(BeamScorer):
                 next_scores[batch_idx].max().item(), cur_len
             )
 
+        return UserDict(
+            {
+                "next_beam_scores": next_beam_scores.view(-1),
+                "next_beam_tokens": next_beam_tokens.view(-1),
+                "next_beam_indices": next_beam_indices.view(-1),
+            }
+        )
+
+    # <bojian/Grape>
+    def process_cuda_graph_compat(self, input_ids, next_scores, next_tokens, next_indices, pad_token_id, eos_token_id):
+        cur_len = input_ids.shape[-1]
+        batch_size = len(self._beam_hyps)
+        device = input_ids.device
+        next_beam_scores = torch.zeros((batch_size, self.group_size), dtype=next_scores.dtype, device=device)
+        next_beam_tokens = torch.zeros((batch_size, self.group_size), dtype=next_tokens.dtype, device=device)
+        next_beam_indices = torch.zeros((batch_size, self.group_size), dtype=next_indices.dtype, device=device)
+
+        for batch_idx, beam_hyp in enumerate(self._beam_hyps):
+            batch_is_done = self._done[batch_idx]
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(batch_is_done):
+                next_beam_scores[batch_idx, :] = 0
+                next_beam_tokens[batch_idx, :] = pad_token_id
+                next_beam_indices[batch_idx, :] = 0
+
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(batch_is_done.bitwise_not()):
+                beam_idx = self._0.clone().detach()
+                beam_idx_ne_group_size = self._true.clone().detach()
+                for beam_token_rank, (next_token, next_score, next_index) in enumerate(
+                    zip(next_tokens[batch_idx], next_scores[batch_idx], next_indices[batch_idx])
+                ):
+                    with G_GRAPE_GLOBAL_INDICATOR_STACK(beam_idx_ne_group_size):
+                        batch_beam_idx = batch_idx * self._group_size + next_index
+                        next_token_eq_eos = next_token == eos_token_id
+                        with G_GRAPE_GLOBAL_INDICATOR_STACK(next_token_eq_eos):
+                            with G_GRAPE_GLOBAL_INDICATOR_STACK(self._group_size > self._beam_array[beam_token_rank]):
+                                beam_hyp.add_cuda_graph_compat(
+                                    input_ids[batch_beam_idx].clone().detach(),
+                                    next_score,
+                                )
+
+                        with G_GRAPE_GLOBAL_INDICATOR_STACK(next_token_eq_eos.bitwise_not()):
+                            next_beam_scores[batch_idx, beam_idx] = next_score
+                            next_beam_tokens[batch_idx, beam_idx] = next_token
+                            next_beam_indices[batch_idx, beam_idx] = batch_beam_idx
+                            beam_idx += self._1
+
+                        beam_idx_ne_group_size = beam_idx != self._group_size
+
+            self._done[batch_idx] = self._done[batch_idx].bitwise_or(
+                beam_hyp.is_done_cuda_graph_compat(next_scores[batch_idx].max(), cur_len)
+            )
         return UserDict(
             {
                 "next_beam_scores": next_beam_scores.view(-1),
@@ -533,7 +619,6 @@ class ConstrainedBeamSearchScorer(BeamScorer):
                 batch_beam_idx = batch_idx * self.group_size + next_index
                 # add to generated hypotheses if end of sentence
                 if (eos_token_id is not None) and (next_token.item() == eos_token_id):
-
                     # if beam_token does not belong to top num_beams tokens, it should not be added
                     is_beam_token_worse_than_top_num_beams = beam_token_rank >= self.group_size
                     if is_beam_token_worse_than_top_num_beams:
@@ -806,7 +891,16 @@ class ConstrainedBeamSearchScorer(BeamScorer):
 
 
 class BeamHypotheses:
-    def __init__(self, num_beams: int, length_penalty: float, early_stopping: bool):
+    def __init__(
+        self,
+        num_beams: int,
+        length_penalty: float,
+        early_stopping: bool,
+        # <bojian/Grape>
+        batch_size=1,
+        max_generate_length=128,
+        # </bojian/Grape>
+    ):
         """
         Initialize n-best list of hypotheses.
         """
@@ -815,6 +909,18 @@ class BeamHypotheses:
         self.num_beams = num_beams
         self.beams = []
         self.worst_score = 1e9
+
+        # <bojian/Grape>
+        self._1 = torch.tensor(1, device="cuda")
+        self._len = torch.tensor(0, device="cuda")
+        self._num_beams = torch.tensor(num_beams, device="cuda")
+        self._is_done_init = torch.tensor([False], device="cuda")
+        self._worst_score = torch.tensor([1e9], device="cuda")
+
+        self._scoreboard = torch.tensor([1e9] * (num_beams + 1), device="cuda")
+        self._scoreboard_items = torch.zeros(num_beams + 1, batch_size, max_generate_length, device="cuda")
+        self._scoreboard_items_v2 = torch.cuda.LongTensor(num_beams + 1)
+        # </bojian/Grape>
 
     def __len__(self):
         """
@@ -836,6 +942,51 @@ class BeamHypotheses:
             else:
                 self.worst_score = min(score, self.worst_score)
 
+    # <bojian/Grape>
+    def add_cuda_graph_compat(self, hyp, sum_logprobs):
+        score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
+        with G_GRAPE_GLOBAL_INDICATOR_STACK((self._len < self._num_beams).bitwise_or(score > self._worst_score)):
+            self._len += self._1
+            len_gt_num_beams_add_one = self._len > (self._num_beams + self._1)
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams_add_one):
+                self._scoreboard[0] = score
+                self._scoreboard_items[0, :, : hyp.shape[-1]] = hyp
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams_add_one.bitwise_not()):
+                self._scoreboard[-1] = score
+                self._scoreboard_items[-1, :, : hyp.shape[-1]] = hyp
+            scoreboard_sort_res = torch.sort(self._scoreboard)
+            self._scoreboard[:] = scoreboard_sort_res.values
+            self._scoreboard_items[:, :, :] = torch.index_select(
+                self._scoreboard_items, dim=0, index=scoreboard_sort_res.indices
+            )
+            len_gt_num_beams = self._len > self._num_beams
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams):
+                self._worst_score[0] = self._scoreboard[1]
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams.bitwise_not()):
+                self._worst_score[0] = torch.min(self._worst_score[0], score)
+
+    def add_cuda_graph_compat_v2(self, hyp, sum_logprobs):
+        score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
+        with G_GRAPE_GLOBAL_INDICATOR_STACK((self._len < self._num_beams).bitwise_or(score > self._worst_score)):
+            self._len += self._1
+            len_gt_num_beams_add_one = self._len > (self._num_beams + self._1)
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams_add_one):
+                self._scoreboard[0] = score
+                BeamHypotheses_copyDataPtr(self._scoreboard_items_v2, 0, hyp.data_ptr())
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams_add_one.bitwise_not()):
+                self._scoreboard[-1] = score
+                BeamHypotheses_copyDataPtr(self._scoreboard_items_v2, self.num_beams, hyp.data_ptr())
+            scoreboard_sort_res = torch.sort(self._scoreboard)
+            self._scoreboard[:] = scoreboard_sort_res.values
+            self._scoreboard_items_v2[:] = torch.index_select(
+                self._scoreboard_items_v2, dim=0, index=scoreboard_sort_res.indices
+            )
+            len_gt_num_beams = self._len > self._num_beams
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams):
+                self._worst_score[0] = self._scoreboard[1]
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams.bitwise_not()):
+                self._worst_score[0] = torch.min(self._worst_score[0], score)
+
     def is_done(self, best_sum_logprobs: float, cur_len: int) -> bool:
         """
         If there are enough hypotheses and that none of the hypotheses being generated can become better than the worst
@@ -850,3 +1001,279 @@ class BeamHypotheses:
             cur_score = best_sum_logprobs / cur_len**self.length_penalty
             ret = self.worst_score >= cur_score
             return ret
+
+    # <bojian/Grape>
+    def is_done_cuda_graph_compat(self, best_sum_logprobs, cur_len):
+        if self.early_stopping:
+            ret = self._is_done_init.clone().detach()
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(self._len >= self._num_beams):
+                ret.bitwise_not()
+            return ret
+        else:
+            ret = self._is_done_init.clone().detach()
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(self._len >= self._num_beams):
+                cur_score = best_sum_logprobs / (cur_len**self.length_penalty)
+                ret.bitwise_or_(self._worst_score >= cur_score)
+            return ret
+
+
+# <bojian/Grape>
+class BeamHypothesesModule(torch.nn.Module):
+    def __init__(self, num_beams, length_penalty, early_stopping, max_generate_length):
+        super().__init__()
+        self.num_beams = num_beams
+        self._num_beams = torch.tensor(num_beams, device="cuda")
+        self.length_penalty = length_penalty
+        self.early_stopping = early_stopping
+        self.max_generate_length = max_generate_length
+
+        self._1 = torch.tensor(1, device="cuda")
+        self._false = torch.tensor([False], device="cuda")
+
+        self.register_buffer("len", torch.tensor(0, device="cuda"))
+        self.register_buffer("worst_score", torch.tensor([1e9], device="cuda"))
+        self.register_buffer("scoreboard", torch.tensor([1e9] * (num_beams + 1), device="cuda"))
+        self.register_buffer(
+            "scoreboard_items",
+            torch.zeros(num_beams + 1, max_generate_length, dtype=torch.int64, device="cuda"),
+        )
+
+    def forward(self, hyp, sum_logprobs, cur_len):
+        score = sum_logprobs / (cur_len**self.length_penalty)
+        with G_GRAPE_GLOBAL_INDICATOR_STACK((self.len < self._num_beams).bitwise_or(score > self.worst_score)):
+            self.len += self._1
+            len_gt_num_beams_add_one = self.len > (self._num_beams + self._1)
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams_add_one):
+                self.scoreboard[0] = score
+                self.scoreboard_items[0, : hyp.shape[-1]] = hyp
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams_add_one.bitwise_not()):
+                self.scoreboard[-1] = score
+                self.scoreboard_items[-1, : hyp.shape[-1]] = hyp
+            scoreboard_sort_res = torch.sort(self.scoreboard)
+            self.scoreboard[:] = scoreboard_sort_res.values
+            self.scoreboard_items[:, :] = torch.index_select(
+                self.scoreboard_items, dim=0, index=scoreboard_sort_res.indices
+            )
+            len_gt_num_beams = self.len > self._num_beams
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams):
+                self.worst_score[0] = self.scoreboard[1]
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(len_gt_num_beams.bitwise_not()):
+                self.worst_score[0] = torch.min(self.worst_score[0], score)
+
+    def is_done(self, best_sum_logprobs, cur_len):
+        if self.early_stopping:
+            ret = self._false.clone().detach()
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(self.len >= self._num_beams):
+                ret.bitwise_not()
+            return ret[0]
+        else:
+            ret = self._false.clone().detach()
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(self.len >= self._num_beams):
+                cur_score = best_sum_logprobs / (cur_len**self.length_penalty)
+                ret.bitwise_or_(self.worst_score >= cur_score)
+            return ret[0]
+
+
+class BeamSearchPostProcessModule(torch.nn.Module):
+    def __init__(
+        self,
+        batch_size,
+        num_beams,
+        num_beam_groups,
+        max_generate_length,
+        length_penalty,
+        early_stopping,
+        logits_processor,
+        pad_token_id,
+        eos_token_id,
+        generation_module,
+    ):
+        super().__init__()
+        self.batch_size = batch_size
+        self.num_beams = num_beams
+        self._num_beams = torch.tensor(num_beams, device="cuda")
+        self.group_size = self.num_beams // num_beam_groups
+        self._group_size = torch.tensor(self.group_size, device="cuda")
+        self.length_penalty = length_penalty
+        self.early_stopping = early_stopping
+
+        self.logits_processor = logits_processor
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = eos_token_id
+        self._0 = torch.tensor(0, device="cuda")
+        self._1 = torch.tensor(1, device="cuda")
+        self._true = torch.tensor([True], device="cuda")
+        self._beam_array = torch.arange(0, 2 * num_beams, device="cuda")
+
+        # For debugging
+        # self.register_buffer("global_inds_copy", torch.zeros(2 * self.num_beams, 20, dtype=torch.bool, device="cuda"))
+        # self.global_inds_copy.zero_()
+        # for i in range(20):
+        #     G_GRAPE_GLOBAL_INDICATOR_STACK._global_inds[i].curr_scope_global_ind_value.zero_()
+        # for i in range(20):
+        #     torch._C._forceMemcpy(
+        #         self.global_inds_copy[beam_token_rank, i].data_ptr(),
+        #         G_GRAPE_GLOBAL_INDICATOR_STACK._global_inds[i].curr_scope_global_ind_value.data_ptr(),
+        #     )
+
+        self.register_buffer("beam_scores", torch.zeros((batch_size, num_beams), device="cuda"))
+        self.beam_scores[:, 1:] = -1e9
+        self.beam_scores = self.beam_scores.view((batch_size * num_beams,))
+        self.register_buffer("done", torch.tensor([False for _ in range(batch_size)], device="cuda"))
+
+        self.beam_hyps = torch.nn.ModuleList()
+        for _ in range(self.batch_size):
+            self.beam_hyps.append(
+                BeamHypothesesModule(
+                    num_beams=num_beams,
+                    length_penalty=length_penalty,
+                    early_stopping=early_stopping,
+                    max_generate_length=max_generate_length,
+                )
+            )
+        self.generation_module = generation_module
+        self.generation_module_cls = type(generation_module)
+
+    def process(self, input_ids, next_scores, next_tokens, next_indices, cur_len):
+        # cur_len = input_ids.shape[-1]
+        device = input_ids.device
+        self.beam_scores = self.beam_scores.zero_().view(self.batch_size, self.group_size)
+        next_beam_tokens = torch.zeros((self.batch_size, self.group_size), dtype=next_tokens.dtype, device=device)
+        next_beam_indices = torch.zeros((self.batch_size, self.group_size), dtype=next_indices.dtype, device=device)
+
+        for batch_idx, beam_hyp in enumerate(self.beam_hyps):
+            batch_is_done = self.done[batch_idx]
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(batch_is_done):
+                self.beam_scores[batch_idx, :] = 0
+                next_beam_tokens[batch_idx, :] = self.pad_token_id
+                next_beam_indices[batch_idx, :] = 0
+
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(batch_is_done.bitwise_not()):
+                beam_idx = self._0.clone().detach()
+                beam_idx_ne_group_size = self._true.clone().detach()
+                for beam_token_rank, (next_token, next_score, next_index) in enumerate(
+                    zip(
+                        next_tokens[batch_idx, : self.group_size],
+                        next_scores[batch_idx, : self.group_size],
+                        next_indices[batch_idx, : self.group_size],
+                    )
+                ):
+                    with G_GRAPE_GLOBAL_INDICATOR_STACK(beam_idx_ne_group_size):
+                        batch_beam_idx = batch_idx * self._group_size + next_index
+                        next_token_eq_eos = next_token == self.eos_token_id
+                        with G_GRAPE_GLOBAL_INDICATOR_STACK(next_token_eq_eos):
+                            try:
+                                with GrapeForceNoInlineCtx("next_token_eq_eos"):
+                                    with G_GRAPE_GLOBAL_INDICATOR_STACK(
+                                        self._group_size > self._beam_array[beam_token_rank]
+                                    ):
+                                        beam_hyp(input_ids[batch_beam_idx].clone().detach(), next_score, cur_len)
+                            except GrapeSkipBlock:
+                                pass
+
+                        with G_GRAPE_GLOBAL_INDICATOR_STACK(next_token_eq_eos.bitwise_not()):
+                            self.beam_scores[batch_idx, beam_idx] = next_score
+                            next_beam_tokens[batch_idx, beam_idx] = next_token
+                            next_beam_indices[batch_idx, beam_idx] = batch_beam_idx
+                            beam_idx.add_(self._1)
+
+                        torch.ne(beam_idx, self._group_size, out=beam_idx_ne_group_size[0])
+
+                with G_GRAPE_GLOBAL_INDICATOR_STACK(beam_idx_ne_group_size):
+                    for beam_token_rank, (next_token, next_score, next_index) in enumerate(
+                        zip(
+                            next_tokens[batch_idx, self.group_size :],
+                            next_scores[batch_idx, self.group_size :],
+                            next_indices[batch_idx, self.group_size :],
+                        )
+                    ):
+                        beam_token_rank += self.group_size
+                        with G_GRAPE_GLOBAL_INDICATOR_STACK(beam_idx_ne_group_size):
+                            try:
+                                with GrapeForceNoInlineCtx("beam_token_rank_gt_group_size"):
+                                    batch_beam_idx = batch_idx * self._group_size + next_index
+                                    next_token_eq_eos = next_token == self.eos_token_id
+                                    with G_GRAPE_GLOBAL_INDICATOR_STACK(next_token_eq_eos):
+                                        with G_GRAPE_GLOBAL_INDICATOR_STACK(
+                                            self._group_size > self._beam_array[beam_token_rank]
+                                        ):
+                                            beam_hyp(input_ids[batch_beam_idx].clone().detach(), next_score, cur_len)
+
+                                    with G_GRAPE_GLOBAL_INDICATOR_STACK(next_token_eq_eos.bitwise_not()):
+                                        self.beam_scores[batch_idx, beam_idx] = next_score
+                                        next_beam_tokens[batch_idx, beam_idx] = next_token
+                                        next_beam_indices[batch_idx, beam_idx] = batch_beam_idx
+                                        beam_idx.add_(self._1)
+
+                                    torch.ne(beam_idx, self._group_size, out=beam_idx_ne_group_size[0])
+                            except GrapeSkipBlock:
+                                pass
+
+            self.done[batch_idx].bitwise_or_(beam_hyp.is_done(next_scores[batch_idx].max(), cur_len))
+
+        self.beam_scores = self.beam_scores.view(-1)
+        return next_beam_tokens.view(-1), next_beam_indices.view(-1)
+
+    def forward(
+        self,
+        input_ids,
+        next_token_logits,
+        cur_len,
+        # past_key_values=None
+    ):
+        # next_token_logits = output_logits[:, -1, :]
+        next_token_scores = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
+        with GrapeRewriterCtx():
+            next_token_scores_processed = self.logits_processor(input_ids, next_token_scores)
+        next_token_scores = next_token_scores_processed + self.beam_scores[:, None].expand_as(next_token_scores)
+        vocab_size = next_token_scores.shape[-1]
+        next_token_scores = next_token_scores.view(self.batch_size, self.num_beams * vocab_size)
+
+        next_token_scores, next_tokens = torch.topk(
+            next_token_scores, 2 * self.num_beams, dim=1, largest=True, sorted=True
+        )
+
+        from .pytorch_utils import torch_int_div  # pylint: disable=import-outside-toplevel
+
+        next_indices = torch_int_div(next_tokens, vocab_size)
+        next_tokens = next_tokens % vocab_size
+
+        with GrapeRewriterCtx():
+            beam_next_tokens, beam_idx = self.process(input_ids, next_token_scores, next_tokens, next_indices, cur_len)
+        # next_iter_past_key_values = None
+        # if self.generation_module_cls in GRAPE_MODULE_CCACHE:
+        #     graphed_module = GRAPE_MODULE_CCACHE[self.generation_module_cls][1]
+        #     graphed_module.configure(input_ids.shape[-1])
+
+        #     fwd_graph_inputs_placeholders = graphed_module.fwd_graph_inputs_placeholders
+        #     graph_idx = graphed_module.graphed_func_cls_handle.graph_idx
+
+        #     next_iter_past_key_values = fwd_graph_inputs_placeholders[graph_idx][-1]
+
+        # if past_key_values is not None:
+        #     reordered_past_key_values = tuple(
+        #         tuple(
+        #             torch.index_select(
+        #                 past_state,
+        #                 0,
+        #                 beam_idx,
+        #                 out=next_iter_past_key_values[i][j] if next_iter_past_key_values is not None else None,
+        #             )
+        #             for j, past_state in enumerate(layer_past)
+        #         )
+        #         for i, layer_past in enumerate(past_key_values)
+        #     )
+        # else:
+        #     reordered_past_key_values = None
+        return (
+            # torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1),
+            beam_next_tokens,
+            beam_idx,
+            next_tokens,
+            next_indices,
+            # reordered_past_key_values,
+            # None,
+        )
+
+
+# </bojian/Grape>

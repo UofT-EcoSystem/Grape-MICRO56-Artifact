@@ -147,6 +147,18 @@ class BatchFeature(UserDict):
             def as_tensor(value):
                 if isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], np.ndarray):
                     value = np.array(value)
+                
+                # <bojian/Grape> Fix for the error "Could not infer dtype of numpy.float32":
+                #
+                # Minimal reproducible example:
+                #
+                #    import numpy as np
+                #    import torch
+                #    torch.tensor(np.array([1], dtype=np.float32))
+                
+                if hasattr(value, "dtype") and value.dtype == np.float32:
+                    return torch.tensor(value, dtype=torch.float32)
+
                 return torch.tensor(value)
 
             is_tensor = torch.is_tensor

@@ -23,6 +23,15 @@ import torch
 from .utils import add_start_docstrings
 from .utils.logging import get_logger
 
+# <bojian/Grape>
+import os
+
+try:
+    from torch.cuda.graphs_ext import C_GRAPE_REWRITE_FOR_CUDA_GRAPH_COMPAT_CSTR, G_GRAPE_GLOBAL_INDICATOR_STACK
+except ImportError:
+    print(f"[W] {__file__} skips the import of graphs_ext")
+
+# </bojian/Grape>
 
 logger = get_logger(__name__)
 
@@ -626,8 +635,24 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
         self.max_length = max_length
         self.eos_token_id = eos_token_id
 
+        # <bojian/Grape>
+        self._max_length_ind = torch.tensor([False] * max_length, dtype=torch.bool, device="cuda")
+        self._max_length_ind[max_length - 1] = True
+        self._0 = torch.tensor(0, device="cuda")
+        self._inf = torch.tensor(-float("inf"), device="cuda")
+        # </bojian/Grape>
+
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         cur_len = input_ids.shape[-1]
+
+        # <bojian/Grape>
+        if int(os.getenv(C_GRAPE_REWRITE_FOR_CUDA_GRAPH_COMPAT_CSTR, "0")):
+            with G_GRAPE_GLOBAL_INDICATOR_STACK(self._max_length_ind[cur_len]):
+                scores[:, :] = self._inf
+                scores[:, self.eos_token_id] = self._0
+            return scores
+        # </bojian/Grape>
+
         if cur_len == self.max_length - 1:
             num_tokens = scores.shape[1]
             scores[:, [i for i in range(num_tokens) if i != self.eos_token_id]] = -float("inf")

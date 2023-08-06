@@ -32,6 +32,13 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 from tqdm.auto import tqdm
 
+# <bojian/Grape>
+# from quik_fix import GPUTimer
+
+G_BACKEND_IDENTIFIER = None
+G_CSV_LOGGER = None
+# </bojian/Grape>
+
 
 # Integrations must be imported before ML frameworks:
 from .integrations import (  # isort: split
@@ -1392,8 +1399,18 @@ class Trainer:
             )
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
+            # <bojian/Grape>
+            # prolog_timer = GPUTimer("Prolog")
+            # training_step_timer = GPUTimer("TrainingStep")
+            # epilog_timer = GPUTimer("Epilog")
+            total_time_on_training_steps = 0.0
+            # </bojian/Grape>
+
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+
+                # <bojian/Grape>
+                # prolog_timer.__enter__()
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
@@ -1410,6 +1427,12 @@ class Trainer:
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
+                # <bojian/Grape>
+                # prolog_timer.__exit__(None, None, None)
+                torch.cuda.synchronize()
+                tic = time.perf_counter()
+                # </bojian/Grape>
+
                 if (
                     ((step + 1) % args.gradient_accumulation_steps != 0)
                     and args.local_rank != -1
@@ -1417,9 +1440,20 @@ class Trainer:
                 ):
                     # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                     with model.no_sync():
-                        tr_loss_step = self.training_step(model, inputs)
+                        # <bojian/Grape>
+                        # tr_loss_step = self.training_step(model, inputs)
+                        tr_loss_step = self.training_step(model, inputs, step)
                 else:
-                    tr_loss_step = self.training_step(model, inputs)
+                    # <bojian/Grape>
+                    # tr_loss_step = self.training_step(model, inputs)
+                    tr_loss_step = self.training_step(model, inputs, step)
+
+                # <bojian/Grape>
+                torch.cuda.synchronize()
+                toc = time.perf_counter()
+                total_time_on_training_steps += toc - tic
+                # epilog_timer.__enter__()
+                # </bojian/Grape>
 
                 if (
                     args.logging_nan_inf_filter
@@ -1500,6 +1534,13 @@ class Trainer:
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+
+                # <bojian/Grape>
+                # epilog_timer.__exit__(None, None, None)
+
+            print(f"Total time on training steps={total_time_on_training_steps}")
+            G_CSV_LOGGER.write(G_BACKEND_IDENTIFIER, total_time_on_training_steps)
+
             if step < 0:
                 logger.warning(
                     f"There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -1981,7 +2022,13 @@ class Trainer:
 
         return ctx_manager
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        # <bojian/Grape> Add the current number of training steps for debugging.
+        step,
+    ) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
 
@@ -2000,15 +2047,49 @@ class Trainer:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
+
+        # <bojian/Grape>
+        # gpu_timer = GPUTimer("PrepareInputs")
+        # gpu_timer.__enter__()
+
         inputs = self._prepare_inputs(inputs)
+
+        # <bojian/Grape>
+        # gpu_timer.__exit__(None, None, None)
+
+        # <bojian/Grape>
+        # os.environ["GLOBAL_CURRENT_TRAINING_STEP"] = f"{step}"
+        # checkpoint_params_for_debugging = False
 
         if is_sagemaker_mp_enabled():
             scaler = self.scaler if self.do_grad_scaling else None
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
+        # <bojian/Grape>
+        # if checkpoint_params_for_debugging:
+        #     for param_idx, param in enumerate(list(model.wav2vec2.encoder.parameters())):
+        #         torch.save(param, f"param_{param_idx}_{step}.pt")
+        # else:
+        #     for param_idx, param in enumerate(list(model.wav2vec2.encoder.parameters())):
+        #         loaded_param = torch.load(f"param_{param_idx}_{step}.pt")
+        #         assert torch.allclose(param, loaded_param), f"{param_idx} {param} != {loaded_param}"
+        # </bojian/Grape>
+
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
+
+        # <bojian/Grape>
+        # if checkpoint_params_for_debugging:
+        #     torch.save(loss, f"loss_{step}.pt")
+        # else:
+        #     loaded_loss = torch.load(f"loss_{step}.pt")
+        #     assert torch.allclose(loss, loaded_loss), f"{loss} != {loaded_loss}"
+        # </bojian/Grape>
+
+        # <bojian/Grape>
+        # gpu_timer = GPUTimer("Backward")
+        # gpu_timer.__enter__()
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -2016,6 +2097,9 @@ class Trainer:
         if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
+
+        # <bojian/Grape> For debugging purposes. Uncomment to run the training checkpoints.
+        # model.wav2vec2.run_checkpoint()
 
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
@@ -2027,6 +2111,23 @@ class Trainer:
             loss = self.deepspeed.backward(loss)
         else:
             loss.backward()
+
+        # gpu_timer.__exit__(None, None, None)
+
+        # <bojian/Grape> For debugging purposes.
+        # model.wav2vec2.run_checkpoint()
+
+        # <bojian/Grape>
+        # if checkpoint_params_for_debugging:
+        #     for param_idx, param in enumerate(list(model.wav2vec2.encoder.parameters())):
+        #         torch.save(param.grad, f"param_{param_idx}_{step}_grad.pt")
+        # else:
+        #     for param_idx, param in enumerate(list(model.wav2vec2.encoder.parameters())):
+        #         loaded_param_grad = torch.load(f"param_{param_idx}_{step}_grad.pt")
+        #         assert torch.allclose(
+        #             param.grad, loaded_param_grad
+        #         ), f"{param_idx} {param.grad} != {loaded_param_grad}"
+        # </bojian/Grape>
 
         return loss.detach()
 
@@ -2041,6 +2142,10 @@ class Trainer:
         else:
             labels = None
         outputs = model(**inputs)
+
+        # <bojian/Grape>
+        # print(f"computed loss={outputs.loss}")
+
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:

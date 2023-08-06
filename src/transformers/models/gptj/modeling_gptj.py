@@ -20,6 +20,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.cuda.graphs import this_thread as this_thread_graphs  # <bojian/Grape>
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -45,11 +46,19 @@ GPTJ_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all GPT-J models at https://huggingface.co/models?filter=gptj
 ]
 
+_10000 = torch.tensor(10000, device="cuda")
+
 
 def fixed_pos_embedding(x, seq_dim=1, seq_len=None):
     dim = x.shape[-1]
     if seq_len is None:
         seq_len = x.shape[seq_dim]
+    # <bojian/Grape>
+    if this_thread_graphs.current_graph_scope is not None:
+        inv_freq = 1.0 / (_10000 ** (torch.arange(0, dim, 2, device="cuda") / dim))
+        sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len, device="cuda"), inv_freq).float()
+        return torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)
+    # </bojian/Grape>
     inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2) / dim))
     sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).to(x.device).float()
     return torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)

@@ -46,6 +46,10 @@ from ...utils import (
 )
 from .configuration_wav2vec2 import Wav2Vec2Config
 
+# <bojian/Grape>
+# from quik_fix import GPUTimer
+# from torch.cuda.graphs_ext import MemoryDebugScope
+
 
 logger = logging.get_logger(__name__)
 
@@ -252,7 +256,9 @@ def _compute_mask_indices(
     )
 
     # SpecAugment mask to fill
-    spec_aug_mask = np.zeros((batch_size, sequence_length), dtype=np.bool)
+    # <bojian/Grape> np.bool -> bool
+    # spec_aug_mask = np.zeros((batch_size, sequence_length), dtype=np.bool)
+    spec_aug_mask = np.zeros((batch_size, sequence_length), dtype=bool)
     spec_aug_mask_idxs = []
 
     max_num_masked_span = compute_num_masked_span(sequence_length)
@@ -445,12 +451,24 @@ class Wav2Vec2PositionalConvEmbedding(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.transpose(1, 2)
 
+        # <bojian/Grape>
         hidden_states = self.conv(hidden_states)
+        # with MemoryDebugScope():
+        #     hidden_states = self.conv(hidden_states)
+        #     print(hidden_states.shape)
+        #     hidden_states_nbytes = hidden_states.element_size() * hidden_states.nelement()
+        #     print(f"hidden_states.nbytes={hidden_states_nbytes / 1024 / 1024} MB")
+
+        # <bojian/Grape> Inconsistency starts here.
+        # tensor_to_debug = self.conv.bias.clone().detach()
+        # tensor_to_debug = hidden_states.clone().detach()
+        tensor_to_debug = None
+
         hidden_states = self.padding(hidden_states)
         hidden_states = self.activation(hidden_states)
 
         hidden_states = hidden_states.transpose(1, 2)
-        return hidden_states
+        return hidden_states, tensor_to_debug
 
 
 class Wav2Vec2SamePadLayer(nn.Module):
@@ -809,7 +827,7 @@ class Wav2Vec2Encoder(nn.Module):
                 attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
             )
 
-        position_embeddings = self.pos_conv_embed(hidden_states)
+        position_embeddings, tensor_to_debug = self.pos_conv_embed(hidden_states)
         hidden_states = hidden_states + position_embeddings
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -821,9 +839,11 @@ class Wav2Vec2Encoder(nn.Module):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = np.random.uniform(0, 1)
+            # dropout_probability = np.random.uniform(0, 1)
 
-            skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
+            skip_the_layer = (
+                False  # True if self.training and (dropout_probability < self.config.layerdrop) else False
+            )
             if not skip_the_layer or deepspeed_zero3_is_enabled:
                 # under deepspeed zero3 all gpus must run in sync
                 if self.gradient_checkpointing and self.training:
@@ -854,12 +874,17 @@ class Wav2Vec2Encoder(nn.Module):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+        # <bojian/Grape>
+        # tensor_to_debug = hidden_states
+
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
         return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
+            # <bojian/Grape>
+            tensor_to_debug=tensor_to_debug,
         )
 
 
@@ -1230,6 +1255,19 @@ WAV_2_VEC_2_INPUTS_DOCSTRING = r"""
 """
 
 
+# <bojian/Grape> For debugging purposes.
+G_CURRENT_TRAINING_ITERATION = 0
+C_TRAINING_ITERATIONS_TO_GRAPH = []
+# C_TRAINING_ITERATIONS_TO_GRAPH = [1, 2]
+C_MAX_TRAINING_ITERATION = 5
+
+
+def get_current_graphed_suffix():
+    return f"_{G_CURRENT_TRAINING_ITERATION}i" + (
+        "_graphed" if G_CURRENT_TRAINING_ITERATION in C_TRAINING_ITERATIONS_TO_GRAPH else "_non_graphed"
+    )
+
+
 @add_start_docstrings(
     "The bare Wav2Vec2 Model transformer outputting raw hidden-states without any specific head on top.",
     WAV_2_VEC_2_START_DOCSTRING,
@@ -1251,6 +1289,16 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
             self.encoder = Wav2Vec2Encoder(config)
 
         self.adapter = Wav2Vec2Adapter(config) if config.add_adapter else None
+
+        self.feature_extractor_seq_lens = set()
+        self.encoder_seq_lens = set()
+
+        # <bojian/Grape> Graphed executors
+        self.graphed_feature_extractor = None
+        self.graphed_feature_extractor_logged_once = False
+        self.graphed_encoder = None
+        self.graphed_encoder_logged_once = False
+        # </bojian/Grape>
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1320,6 +1368,16 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
 
         return hidden_states
 
+    # <bojian/Grape> For debugging purposes.
+    def run_checkpoint(self):
+        print(f"G_CURRENT_TRAINING_ITERATION={G_CURRENT_TRAINING_ITERATION}")
+        input_hidden_states = torch.load("hidden_states_1i_graphed.pt")
+        self.graphed_encoder.configure(199)
+        tensor_to_debug = self.graphed_encoder(input_hidden_states).tensor_to_debug
+        print(tensor_to_debug)
+
+    # </bojian/Grape>
+
     @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         processor_class=_PROCESSOR_FOR_DOC,
@@ -1338,13 +1396,39 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, Wav2Vec2BaseModelOutput]:
+        # <bojian/Grape> For debugging purposes.
+        # global G_CURRENT_TRAINING_ITERATION
+        # if G_CURRENT_TRAINING_ITERATION < C_MAX_TRAINING_ITERATION:
+        #     G_CURRENT_TRAINING_ITERATION += 1
+        # else:
+        #     assert (
+        #         False
+        #     ), f"Current training iteration reaches the maximum training iteration={C_MAX_TRAINING_ITERATION}"
+        # </bojian/Grape>
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        extract_features = self.feature_extractor(input_values)
+        # <bojian/Grape>
+        # gpu_timer = GPUTimer("FeatureExtractor")
+        # gpu_timer.__enter__()
+        # </bojian/Grape>
+
+        # <bojian/Grape>
+        # self.feature_extractor_seq_lens.add(input_values.shape[-1])
+        if self.graphed_feature_extractor is not None:
+            if not self.graphed_feature_extractor_logged_once:
+                logger.info("Using the graphed feature extractor")
+                self.graphed_feature_extractor_logged_once = True
+            self.graphed_feature_extractor.configure(input_values.shape[-1])
+            extract_features = self.graphed_feature_extractor(input_values)
+        else:
+            extract_features = self.feature_extractor(input_values)
+        # </bojian/Grape>
+
         extract_features = extract_features.transpose(1, 2)
 
         if attention_mask is not None:
@@ -1358,15 +1442,75 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
             hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
         )
 
-        encoder_outputs = self.encoder(
-            hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        # <bojian/Grape>
+        # gpu_timer.__exit__(None, None, None)
+        # gpu_timer = GPUTimer("Encoder")
+        # gpu_timer.__enter__()
+        # </bojian/Grape>
+
+        # with GPUTimer("Encoder"):
+        if self.graphed_encoder is not None:
+            if not self.graphed_encoder_logged_once:
+                logger.info("Using the graphed encoder")
+                self.graphed_encoder_logged_once = True
+
+            # <bojian/Grape> For debugging purposes. Uncomment to log the training checkpoints.
+            # torch.save(torch.get_rng_state(), f"torch_rng_state{get_current_graphed_suffix()}.pt")
+            # torch.save(hidden_states, f"hidden_states{get_current_graphed_suffix()}.pt")
+            # torch.save(self.encoder, f"encoder{get_current_graphed_suffix()}.pt")
+
+            # if G_CURRENT_TRAINING_ITERATION in C_TRAINING_ITERATIONS_TO_GRAPH:
+            #     if hidden_states.shape[-2] >= self.graphed_encoder_hi_start:
+            #         self.graphed_encoder_hi.configure(hidden_states.shape[-2])
+            #         encoder_outputs = self.graphed_encoder_hi(hidden_states)
+            #     elif hidden_states.shape[-2] >= self.graphed_encoder_mid_start:
+            #         self.graphed_encoder_mid.configure(hidden_states.shape[-2])
+            #         encoder_outputs = self.graphed_encoder_mid(hidden_states)
+            #     else:
+            #         self.graphed_encoder_lo.configure(hidden_states.shape[-2])
+            #         encoder_outputs = self.graphed_encoder_lo(hidden_states)
+            # else:
+            #     encoder_outputs = self.encoder(
+            #         hidden_states,
+            #         attention_mask=attention_mask,
+            #         output_attentions=output_attentions,
+            #         output_hidden_states=output_hidden_states,
+            #         return_dict=return_dict,
+            #     )
+            self.graphed_encoder.configure(hidden_states.shape[-2])
+            encoder_outputs = self.graphed_encoder(hidden_states)
+
+            # No longer distinguish between high/medium/low encoders.
+            # if hidden_states.shape[-2] >= self.graphed_encoder_hi_start:
+            #     self.graphed_encoder_hi.configure(hidden_states.shape[-2])
+            #     encoder_outputs = self.graphed_encoder_hi(hidden_states)
+            # elif hidden_states.shape[-2] >= self.graphed_encoder_mid_start:
+            #     self.graphed_encoder_mid.configure(hidden_states.shape[-2])
+            #     encoder_outputs = self.graphed_encoder_mid(hidden_states)
+            # else:
+            #     self.graphed_encoder_lo.configure(hidden_states.shape[-2])
+            #     encoder_outputs = self.graphed_encoder_lo(hidden_states)
+
+            # torch.save(torch.get_rng_state(), f"torch_rng_post_state{get_current_graphed_suffix()}.pt")
+            # torch.save(
+            #     encoder_outputs.last_hidden_state, f"encoder_last_hidden_state{get_current_graphed_suffix()}.pt"
+            # )
+            # torch.save(encoder_outputs.tensor_to_debug, f"encoder_tensor_to_debug{get_current_graphed_suffix()}.pt")
+
+        else:
+            encoder_outputs = self.encoder(
+                hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        # </bojian/Grape>
 
         hidden_states = encoder_outputs[0]
+
+        # <bojian/Grape>
+        # gpu_timer.__exit__(None, None, None)
 
         if self.adapter is not None:
             hidden_states = self.adapter(hidden_states)
@@ -1721,6 +1865,11 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
             return_dict=return_dict,
         )
 
+        # <bojian/Grape>
+        # gpu_timer = GPUTimer("CTC")
+        # gpu_timer.__enter__()
+        # </bojian/Grape>
+
         hidden_states = outputs[0]
         hidden_states = self.dropout(hidden_states)
 
@@ -1757,6 +1906,9 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
                     reduction=self.config.ctc_loss_reduction,
                     zero_infinity=self.config.ctc_zero_infinity,
                 )
+
+        # <bojian/Grape>
+        # gpu_timer.__exit__(None, None, None)
 
         if not return_dict:
             output = (logits,) + outputs[_HIDDEN_STATES_START_POSITION:]

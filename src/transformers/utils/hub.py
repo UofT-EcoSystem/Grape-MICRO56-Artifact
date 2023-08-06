@@ -488,10 +488,14 @@ def get_from_cache(
             # We favor a custom header indicating the etag of the linked resource, and
             # we fallback to the regular etag header.
             # If we don't have any of those, raise an error.
-            if etag is None:
-                raise OSError(
-                    "Distant resource does not have an ETag, we won't be able to reliably ensure reproducibility."
-                )
+
+            # <bojian/Grape> Comment out the check on etag.
+            # if etag is None:
+            #     raise OSError(
+            #         "Distant resource does not have an ETag, we won't be able to reliably ensure reproducibility."
+            #     )
+            # </bojian/Grape>
+
             # In case of a redirect,
             # save an extra redirect on the request.get call,
             # and ensure we download the exact atomic version even if it changed
@@ -520,32 +524,35 @@ def get_from_cache(
 
     # etag is None == we don't have a connection or we passed local_files_only.
     # try to get the last downloaded one
-    if etag is None:
-        if os.path.exists(cache_path):
-            return cache_path
-        else:
-            matching_files = [
-                file
-                for file in fnmatch.filter(os.listdir(cache_dir), filename.split(".")[0] + ".*")
-                if not file.endswith(".json") and not file.endswith(".lock")
-            ]
-            if len(matching_files) > 0:
-                return os.path.join(cache_dir, matching_files[-1])
-            else:
-                # If files cannot be found and local_files_only=True,
-                # the models might've been found if local_files_only=False
-                # Notify the user about that
-                if local_files_only:
-                    raise FileNotFoundError(
-                        "Cannot find the requested files in the cached path and outgoing traffic has been"
-                        " disabled. To enable model look-ups and downloads online, set 'local_files_only'"
-                        " to False."
-                    )
-                else:
-                    raise ValueError(
-                        "Connection error, and we cannot find the requested files in the cached path."
-                        " Please try again or make sure your Internet connection is on."
-                    )
+
+    # <bojian/Grape>
+    # if etag is None:
+    #     if os.path.exists(cache_path):
+    #         return cache_path
+    #     else:
+    #         matching_files = [
+    #             file
+    #             for file in fnmatch.filter(os.listdir(cache_dir), filename.split(".")[0] + ".*")
+    #             if not file.endswith(".json") and not file.endswith(".lock")
+    #         ]
+    #         if len(matching_files) > 0:
+    #             return os.path.join(cache_dir, matching_files[-1])
+    #         else:
+    #             # If files cannot be found and local_files_only=True,
+    #             # the models might've been found if local_files_only=False
+    #             # Notify the user about that
+    #             if local_files_only:
+    #                 raise FileNotFoundError(
+    #                     "Cannot find the requested files in the cached path and outgoing traffic has been"
+    #                     " disabled. To enable model look-ups and downloads online, set 'local_files_only'"
+    #                     " to False."
+    #                 )
+    #             else:
+    #                 raise ValueError(
+    #                     "Connection error, and we cannot find the requested files in the cached path."
+    #                     " Please try again or make sure your Internet connection is on."
+    #                 )
+    # </bojian/Grape>
 
     # From now on, etag is not None.
     if os.path.exists(cache_path) and not force_download:
@@ -582,7 +589,9 @@ def get_from_cache(
         with temp_file_manager() as temp_file:
             logger.info(f"{url} not found in cache or force_download set to True, downloading to {temp_file.name}")
 
-            http_get(url_to_download, temp_file, proxies=proxies, resume_size=resume_size, headers=headers)
+            # <bojian/Grape> Fix the URL to download.
+            # http_get(url_to_download, temp_file, proxies=proxies, resume_size=resume_size, headers=headers)
+            http_get(url, temp_file, proxies=proxies, resume_size=resume_size, headers=headers)
 
         logger.info(f"storing {url} in cache at {cache_path}")
         os.replace(temp_file.name, cache_path)
