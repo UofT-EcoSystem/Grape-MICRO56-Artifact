@@ -1,6 +1,6 @@
-PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE[0]})/.. && pwd)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
 
-source ${PROJECT_ROOT}/scripts/hl.sh
+source ${PROJECT_ROOT}/scripts/hl
 
 export PYTHONPATH="\
 ${PROJECT_ROOT}/submodules/pytorch:\

@@ -6,10 +6,10 @@
 
 export NVIDIA_DRIVER_VERSION=525.89.02
 
-PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE[0]})/.. && pwd)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
 cd ${PROJECT_ROOT}
 
-source scripts/hl.sh
+source scripts/hl
 
 IS_REINSTALL=0
 

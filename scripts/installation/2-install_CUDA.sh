@@ -7,10 +7,10 @@ export NSIGHT_SYSTEMS_VERSION="2022.4.2"
 UBUNTU_VERSION=$(lsb_release -sr)
 CUDA_VERSION_DOT_SEP=${CUDA_VERSION/-/.}
 
-PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE[0]})/.. && pwd)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
 cd ${PROJECT_ROOT}
 
-source scripts/hl.sh
+source scripts/hl
 
 if [ ${UBUNTU_VERSION} == "22.04" ]; then
         # https://gitlab.com/nvidia/container-images/cuda/-/blob/master/dist/12.0.0/ubuntu2204/base/Dockerfile?ref_type=heads#L25-26

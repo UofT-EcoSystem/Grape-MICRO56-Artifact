@@ -1,9 +1,9 @@
 #!/bin/bash -e
 
-PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE[0]})/.. && pwd)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
 cd ${PROJECT_ROOT}
 
-source scripts/hl.sh
+source scripts/hl
 
 echo "[$(emph 1/1)] Installing build essentials ..."
 

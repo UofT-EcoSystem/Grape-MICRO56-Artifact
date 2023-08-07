@@ -2,10 +2,10 @@
 
 UBUNTU_VERSION=$(lsb_release -sr)
 
-PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE[0]})/.. && pwd)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
 cd ${PROJECT_ROOT}
 
-source scripts/hl.sh
+source scripts/hl
 
 IS_REBUILD=0
 
