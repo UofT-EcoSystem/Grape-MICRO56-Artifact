@@ -23,7 +23,8 @@ sudo apt-get install -y --no-install-recommends git \
         libboost-filesystem-dev \
         rustc \
         cargo \
-        libssl-dev
+        libssl-dev \
+        csvtool
 wget https://bootstrap.pypa.io/get-pip.py
 python get-pip.py
 rm -f get-pip.py
