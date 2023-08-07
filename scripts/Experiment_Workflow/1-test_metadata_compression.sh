@@ -5,9 +5,8 @@ cd ${PROJECT_ROOT}
 
 source scripts/hl
 
+echo "Running the test cases on the metadata compression ..."
 cd experiments
-
-echo "Running the test cases on the metadata compression"
 
 echo "[$(emph 1/3)] GPT-2"
 pytest test_metadata_compression.py::test_gpt2
