@@ -15,7 +15,7 @@ source scripts/hl
 if [ ${UBUNTU_VERSION} == "22.04" ]; then
         # https://gitlab.com/nvidia/container-images/cuda/-/blob/master/dist/12.0.0/ubuntu2204/base/Dockerfile?ref_type=heads#L25-26
         curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${NVARCH}/cuda-keyring_1.0-1_all.deb
-        dpkg -i cuda-keyring_1.0-1_all.deb
+        sudo dpkg -i cuda-keyring_1.0-1_all.deb
 elif [ ${UBUNTU_VERSION} == "20.04" ]; then
         # https://gitlab.com/nvidia/container-images/cuda/-/blob/master/dist/12.0.0/ubuntu2004/base/Dockerfile?ref_type=heads#L25-26
         curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/${NVARCH}/3bf863cc.pub | apt-key add -
