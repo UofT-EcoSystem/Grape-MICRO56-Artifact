@@ -6,6 +6,7 @@ cd ${PROJECT_ROOT}
 source scripts/hl
 
 echo "Profiling the runtime breakdown ..."
+export PROFILE_GENERATE=1
 cd experiments
 
 echo "[$(emph 1/2)] PtGraph"

@@ -48,6 +48,9 @@ def teardown_module(module):  # pylint: disable=unused-argument
 
 
 def test_baseline(gpt2_model_fixture):  # pylint: disable=redefined-outer-name
+    if CONFIG_PROFILE_GENERATE:
+        gpt2_generate_profile.global_attrs = {"Executor": "Baseline"}
+
     sample_input = torch.randint(
         0,
         gpt2_model_fixture.model.config.vocab_size,
@@ -68,6 +71,9 @@ def test_baseline(gpt2_model_fixture):  # pylint: disable=redefined-outer-name
 
 
 def test_ptgraph(gpt2_model_fixture):  # pylint: disable=redefined-outer-name
+    if CONFIG_PROFILE_GENERATE:
+        gpt2_generate_profile.global_attrs = {"Executor": "PtGraph"}
+
     sample_input = torch.randint(
         0,
         gpt2_model_fixture.model.config.vocab_size,
@@ -98,6 +104,9 @@ def test_ptgraph(gpt2_model_fixture):  # pylint: disable=redefined-outer-name
 )
 def test_grape(gpt2_model_fixture):  # pylint: disable=redefined-outer-name
     G_GRAPE_GLOBAL_INDICATOR_STACK.reserve(20)
+
+    if CONFIG_PROFILE_GENERATE:
+        gpt2_generate_profile.global_attrs = {"Executor": "Grape"}
 
     graphs_ext.CONFIG_EARLY_COPYING = True
     generation_utils.CONFIG_GRAPH_BEAM_SEARCH = True

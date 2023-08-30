@@ -33,7 +33,7 @@ else
 fi
 echo "Uninstalling all existing NVIDIA GPU driver components ..."
 if [ -x $(command -v nvidia-uninstall) ]; then
-        sudo nvidia-uninstall
+        sudo nvidia-uninstall || true
 fi
 if [ ${IS_REINSTALL} == "0" ]; then
         sudo apt-get purge -y "^nvidia*" && sudo apt-get autoremove -y
@@ -46,7 +46,7 @@ cd submodules/open-gpu-kernel-modules
 
 if [ ${IS_REINSTALL} == "0" ]; then
         echo "[$(emph 3/6)] Downloading the official driver installer ..."
-        wget https://us.download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run
+        wget --backups=1 https://us.download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run
 
         echo "[$(emph 4/6)] Configuring the Linux kernel modules to avoid potential installation and runtime errors ..."
 
@@ -54,30 +54,32 @@ if [ ${IS_REINSTALL} == "0" ]; then
         #
         # Reference: https://superuser.com/q/1214116
         echo -e "[ req ] \n\
-        default_bits = 4096 \n\
-        distinguished_name = req_distinguished_name \n\
-        prompt = no \n\
-        x509_extensions = myexts \n\
+default_bits = 4096 \n\
+distinguished_name = req_distinguished_name \n\
+prompt = no \n\
+x509_extensions = myexts \n\
 
-        [ req_distinguished_name ] \n\
-        CN = Modules \n\
-        \n\
-        [ myexts ] \n\
-        basicConstraints=critical,CA:FALSE \n\
-        keyUsage=digitalSignature \n\
-        subjectKeyIdentifier=hash \n\
-        authorityKeyIdentifier=keyid" >x509.genkey
+[ req_distinguished_name ] \n\
+CN = Modules \n\
+\n\
+[ myexts ] \n\
+basicConstraints=critical,CA:FALSE \n\
+keyUsage=digitalSignature \n\
+subjectKeyIdentifier=hash \n\
+authorityKeyIdentifier=keyid" >x509.genkey
 
         openssl req -new -nodes -utf8 -sha512 -days 36500 -batch -x509 -config x509.genkey -outform DER -out signing_key.x509 -keyout signing_key.pem
-        sudo mv signing_key.pem signing_key.x509 $(find /usr/src/linux-*/certs)
+        for certs in /usr/src/linux-*/certs; do
+                sudo cp signing_key.pem signing_key.x509 ${certs}
+        done
 
         # Resolve issue: "The Nouveau kernel driver is currently in use" when the user
         # space component is being installed.
         #
         # Reference: https://askubuntu.com/q/841876
-        sudo echo "\
-        blacklist nouveau
-        options nouveau modeset=0" >/etc/modprobe.d/blacklist-nouveau.conf
+        echo "\
+blacklist nouveau
+options nouveau modeset=0" | sudo tee /etc/modprobe.d/blacklist-nouveau.conf
         sudo update-initramfs -u
 
         # Resolve issue: "NVRM: GPU 0000:01:00.0: RmInitAdapter failed!" when when the
@@ -85,7 +87,7 @@ if [ ${IS_REINSTALL} == "0" ]; then
         # NVIDIA RTX 3090).
         #
         # Reference: https://github.com/NVIDIA/open-gpu-kernel-modules#compatible-gpus
-        sudo echo "options nvidia NVreg_OpenRmEnableUnsupportedGpus=1" >/etc/modprobe.d/whitelist-unsupported-gpus.conf
+        echo "options nvidia NVreg_OpenRmEnableUnsupportedGpus=1" | sudo tee /etc/modprobe.d/whitelist-unsupported-gpus.conf
 fi
 
 if [ ${IS_REINSTALL} == "0" ]; then
