@@ -440,7 +440,8 @@ void instantiateCUDAGraphsOnCompressedMetadata(
             std::string("metadata_compression.csv")),
         std::ios_base::app);
     fout << dmlc::GetEnv("MODEL", std::string("")) << ","
-         << buffer_reserved_size << "," << gpu_memory_per_graph << "\n";
+         << buffer_reserved_size * 1.0 / (1024 * 1024) << ","
+         << gpu_memory_per_graph << "\n";
   }
 
   if (debug_mode) {
