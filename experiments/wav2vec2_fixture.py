@@ -188,6 +188,7 @@ model = Wav2Vec2ForCTC.from_pretrained(
     ctc_loss_reduction="mean",
     pad_token_id=processor.tokenizer.pad_token_id,  # pylint: disable=no-member
 )
+model.cuda()
 model.wav2vec2.encoder.gradient_checkpointing = False
 
 model.freeze_feature_encoder()
@@ -212,7 +213,7 @@ def encoder_args_generator(seq_len):
     return torch.empty(
         8,
         seq_len,
-        wav2vec2_fixture.model.config.hidden_size,
+        model.config.hidden_size,
         dtype=torch.float16,
         device="cuda",
     )
