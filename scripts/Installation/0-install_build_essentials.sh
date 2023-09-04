@@ -25,7 +25,7 @@ sudo apt-get install -y --no-install-recommends git \
         cargo \
         libssl-dev \
         csvtool
-wget -O https://bootstrap.pypa.io/get-pip.py
+wget --backups=1 https://bootstrap.pypa.io/get-pip.py
 python get-pip.py
 rm -f get-pip.py
 
