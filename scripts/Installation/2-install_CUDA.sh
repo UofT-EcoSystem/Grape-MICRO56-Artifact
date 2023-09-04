@@ -44,9 +44,10 @@ sudo apt-get install -y cuda-cudart-${CUDA_VERSION} \
 sudo apt-get install -y nsight-systems-${NSIGHT_SYSTEMS_VERSION}
 
 cd /usr/local/cuda
+sudo rm -rf samples
 sudo git clone https://github.com/NVIDIA/cuda-samples samples
 cd samples
-git checkout v12.0
+sudo git checkout v12.0
 
 echo "\
 export PATH=\${PATH}:/usr/local/cuda/bin
