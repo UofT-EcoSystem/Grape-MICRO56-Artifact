@@ -12,7 +12,7 @@ echo "[$(emph 1/3)] GPT-2"
 pytest test_metadata_compression.py::test_gpt2
 
 echo "[$(emph 2/3)] GPT-J"
-pytest test_metadata_compression.py::test_gpt2
+TEST_GPTJ=1 pytest test_metadata_compression.py::test_gptj
 
 echo "[$(emph 3/3)] Wav2Vec2"
 pytest test_metadata_compression.py::test_wav2vec2
