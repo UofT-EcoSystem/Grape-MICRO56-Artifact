@@ -4,7 +4,6 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 cd ${PROJECT_ROOT}
 
 source scripts/hl
-source scripts/Experiment_Workflow/test_e2e_runtime
 
 MODEL=
 
