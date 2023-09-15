@@ -35,7 +35,7 @@ pip install pyyaml typing_extensions
 # Quik-Fix
 pip install nvtx cloudpickle
 # HuggingFace
-pip install filelock regex sacremoses tokenizers==0.11.1 \
+pip install filelock regex sacremoses tokenizers==0.12.0 \
         huggingface-hub==0.1.0 tqdm
 # Wav2Vec2
 pip install datasets==1.18.3 librosa jiwer
